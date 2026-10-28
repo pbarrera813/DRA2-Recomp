@@ -1,0 +1,6 @@
+# Everything built from your disc: game files and anything derived from them.
+work/
+installer/output/
+# The game's own icon, for a private build only (project/CMakeLists.txt uses it when present).
+project/res/
+__pycache__/

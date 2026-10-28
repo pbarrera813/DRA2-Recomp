@@ -1,0 +1,2 @@
+# The patch must reach git apply byte for byte: never convert its line endings.
+*.patch -text
