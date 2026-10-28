@@ -1,16 +1,11 @@
-"""Function entries hidden inside merged functions, found from pointers to them.
+"""Missed function entries found from pointers to them.
 
-Indirect calls (vtables, thread starts, callbacks) only reveal a missed entry when the game reaches it,
-one 20-minute iteration at a time (0x17CB30, 0xCFB50, 0xC3470). A missed entry that detection merged
-into the function before it has a recognisable shape: a real function pointer refers to it, it is a
-clean instruction start on a 16-byte boundary, and the previous clean instruction ends control flow
-(ret/jmp) followed by nop/int3 padding. Splitting there cannot cut a fallthrough, unlike the
-short-jump labels stub_seeds.py rejects.
+An entry qualifies when a real function pointer (a word in .rdata/.data, or a push/mov immediate)
+refers to it, it is a clean instruction start on a 16-byte boundary, and the instruction before it
+ends control flow (ret/jmp) followed by padding. Code bytes are not used as pointers: jump tables
+and hand-aligned CRT case labels look like function starts.
 
-Real function pointers are 4-aligned words in .rdata/.data (vtables, callback tables) and push/mov
-immediates in code (thread starts). Not arbitrary code bytes: jump tables sit inside .text, and
-hand-written CRT asm (memcpy at 0x1DD600) pads and aligns its case labels exactly like function
-starts -- iteration 14 split memcpy that way. Usage: pointer_seeds.py <pipeline-N> <xbe> <out.json>
+Usage: pointer_seeds.py <pipeline dir> <xbe> <out.json>
 """
 import json
 from pathlib import Path
@@ -33,7 +28,7 @@ for asm in sorted((pipe/'disasm/asm').glob('*.asm')):
             if m[3] in ('push', 'mov') and imm.search(m[4]):
                 code_imms.add(int(imm.search(m[4])[1], 16))
 insns.sort()
-prev_end = {}                                   # clean start -> (previous non-padding mnemonic, padded?)
+prev_end = {}
 last, padded = None, False
 for a, mn in insns:
     prev_end[a] = (last, padded)
@@ -51,10 +46,8 @@ for k in range(struct.unpack_from('<I', d, 0x11C)[0]):
     if d[name - base:d.index(b'\x00', name - base)] in (b'.rdata', b'.data'):
         words = [struct.unpack_from('<I', d, raw + o)[0] for o in range(0, size - 3, 4)]
         values |= set(words)
-        # A vtable slot next to a known function start, pointing at an aligned .text address that the
-        # decode runs straight through: a jump table after a ret was decoded as junk across a real
-        # entry (0xF2F20, the battle's next step). Seeding fixes the decode there; it cannot split
-        # real code, because real code would not have an entry in the middle of an instruction.
+        # A vtable slot beside a known entry, pointing into bytes decoded as one instruction: the
+        # decode is wrong there, since real code has no entry inside an instruction.
         for i, v in enumerate(words):
             if 0x11000 <= v < text_end and v % 16 == 0 and v not in prev_end and v not in starts and (
                     (i and words[i - 1] in starts) or (i + 1 < len(words) and words[i + 1] in starts)):

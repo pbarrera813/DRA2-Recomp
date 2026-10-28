@@ -1,5 +1,5 @@
 diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
-index 258048c..c0d01e7 100644
+index 258048c..ced61f6 100644
 --- a/src/apu/apu_core.c
 +++ b/src/apu/apu_core.c
 @@ -76,6 +76,9 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
@@ -20,12 +20,9 @@ index 258048c..c0d01e7 100644
      qemu_mutex_unlock(&d->lock);
      g_esp = XBOX_WORKER_STACK_TOP(slot);
      g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-@@ -176,10 +180,14 @@ static void apu_deliver_irq(MCPXAPUState *d)
-     qemu_mutex_lock(&d->lock);
+@@ -177,9 +181,11 @@ static void apu_deliver_irq(MCPXAPUState *d)
  
      {
-+        /* Powers of two after the first three: the rate and the asserted
-+         * bits, without a line per interrupt. */
          static unsigned n;
 -        if (n++ < 3) {
 -            fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
@@ -38,7 +35,7 @@ index 258048c..c0d01e7 100644
              fflush(stderr);
          }
      }
-@@ -298,7 +306,7 @@ static struct {
+@@ -298,7 +304,7 @@ static struct {
  
  /* Ring of waveOut buffers for double-buffering */
  #define WAVEOUT_NUM_BUFS 4
@@ -47,7 +44,7 @@ index 258048c..c0d01e7 100644
  #define MIXER_FRAME_SAMPLES 256  /* Internal mixing frame size (matches frame_buf) */
  
  typedef struct {
-@@ -306,12 +314,59 @@ typedef struct {
+@@ -306,12 +312,58 @@ typedef struct {
      WAVEHDR  hdrs[WAVEOUT_NUM_BUFS];
      int16_t  bufs[WAVEOUT_NUM_BUFS][WAVEOUT_BUF_SAMPLES][2];
      int      next_buf;
@@ -58,9 +55,8 @@ index 258048c..c0d01e7 100644
  
  static WaveOutState g_waveout = { 0 };
  
-+/* RECOMP_APU_LEVELS: peak level at each stage boundary (VP mixbins, DSP
-+ * output in the monitor buffer, the buffer handed to the host) and the
-+ * active voice count, every 5 s -- where does the game's audio disappear. */
++/* RECOMP_APU_LEVELS: peak level at each stage boundary and the active voice
++ * count, every 5 s. */
 +extern unsigned g_apu_vp_active;
 +extern float g_apu_vp_vpeak[MCPX_HW_MAX_VOICES], g_apu_vp_vea[MCPX_HW_MAX_VOICES];
 +void mcpx_apu_vp_describe(MCPXAPUState *d, uint16_t v);
@@ -107,7 +103,7 @@ index 258048c..c0d01e7 100644
  void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
  {
      (void)errp;
-@@ -383,92 +438,71 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
+@@ -383,92 +435,63 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
          return;
      }
  
@@ -172,13 +168,8 @@ index 258048c..c0d01e7 100644
 -        /* Test tone (skip if muted) */
 -        if (g_test_tone.active && !g_audio_muted) {
 -            for (int i = 0; i < chunk; i++) {
-+    /* frame_buf holds this EP frame: the 256 samples the DSP stage (or the VP
-+     * monitor) wrote over the last eight VP frames. This used to clear it and
-+     * then render 1024 (XAudio2) or 2048 (waveOut) fresh samples per 256-sample
-+     * frame from the test tone and software mixer alone, so everything the
-+     * title plays through the voice processor was produced and never heard
-+     * (RECOMP_APU_LEVELS: dsp_peak 32767, out_peak 0). Send exactly this frame,
-+     * then clear it for the next (the VP monitor accumulates into it). */
++    /* frame_buf holds the 256 samples the DSP stage wrote for this frame: send
++     * exactly that, then clear it (the VP monitor accumulates into it). */
 +    int16_t (*buf)[2] = d->monitor.frame_buf;
 +    if (g_audio_muted) {
 +        memset(buf, 0, sizeof(d->monitor.frame_buf));
@@ -218,7 +209,6 @@ index 258048c..c0d01e7 100644
 -    g_waveout.next_buf = (idx + 1) % WAVEOUT_NUM_BUFS;
 -    g_waveout.frames_written++;
 +    {
-+        /* With RECOMP_APU_CAPTURE, the final output too (apu-out.raw). */
 +        static int cap = -1;
 +        static FILE *capf;
 +        if (cap < 0) {
@@ -230,11 +220,9 @@ index 258048c..c0d01e7 100644
 +    if (xa2_is_active()) {
 +        xa2_submit_samples((const int16_t *)buf, MIXER_FRAME_SAMPLES);
 +    } else if (g_waveout.initialized) {
-+        /* Eight frames fill one waveOut buffer. */
 +        int idx = g_waveout.next_buf;
 +        WAVEHDR *hdr = &g_waveout.hdrs[idx];
 +        if (g_waveout.fill == 0) {
-+            /* Wait if this buffer is still playing (with timeout) */
 +            int wait_loops = 0;
 +            while (!(hdr->dwFlags & WHDR_DONE) && (hdr->dwFlags & WHDR_INQUEUE)) {
 +                qemu_mutex_unlock(&d->lock);
@@ -257,22 +245,19 @@ index 258048c..c0d01e7 100644
  }
  
  /* ============================================================
-@@ -483,8 +517,13 @@ static void throttle(MCPXAPUState *d)
+@@ -483,8 +506,10 @@ static void throttle(MCPXAPUState *d)
  
      int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
  
-+    /* Catch up after an ordinary oversleep; start over only after a real
-+     * stall. Resetting whenever the frame thread woke more than one frame
-+     * (5.33 ms) late threw that time away, and with Windows' default ~15.6 ms
-+     * timer that was most wakeups: the APU made 5 s of audio per ~5.8 s of
-+     * wall time (86%), and the output ran dry ~4 times a second. */
++    /* Catch up after an oversleep (Windows' timer is ~15.6 ms); restart the
++     * schedule only after a real stall. */
      if (d->next_frame_time_us == 0 ||
 -        now_us - d->next_frame_time_us > EP_FRAME_US) {
 +        now_us - d->next_frame_time_us > 100000) {
          d->next_frame_time_us = now_us;
      }
  
-@@ -530,6 +569,7 @@ static void se_frame(MCPXAPUState *d)
+@@ -530,6 +555,7 @@ static void se_frame(MCPXAPUState *d)
  
      mcpx_apu_vp_frame(d, mixbins);
      mcpx_apu_dsp_frame(d, mixbins);
@@ -280,26 +265,24 @@ index 258048c..c0d01e7 100644
      mcpx_apu_monitor_frame(d);
  
      d->ep_frame_div++;
-@@ -666,6 +706,9 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
+@@ -666,6 +692,8 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      g_apu_ram_ptr = ram_ptr;
      g_state = d;
      d->ram_ptr = ram_ptr;
-+    /* RECOMP_AUDIO_MUTE: silent output with every stage still running, for
-+     * automated runs on a machine someone is listening to. */
++    /* RECOMP_AUDIO_MUTE: silent output, every stage still running. */
 +    g_audio_muted = getenv("RECOMP_AUDIO_MUTE") != NULL;
  
      d->set_irq = false;
      d->exiting = false;
 diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
-index b3c9305..1e49256 100644
+index b3c9305..e19d70a 100644
 --- a/src/apu/apu_mmio_hook.c
 +++ b/src/apu/apu_mmio_hook.c
-@@ -265,14 +265,16 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+@@ -265,14 +265,15 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
       * what it is waiting for is to see the register traffic that precedes the
       * wait. */
      if (getenv("RECOMP_APU_TRACE")) {
-+        /* And powers of two after the first 400, so a poll that starts late
-+         * still shows up as the register it keeps reading. */
++        /* Then at powers of two, so a late-starting poll still shows. */
          static unsigned n;
 -        if (n++ < 400) {
 +        if (++n <= 400 || !(n & (n - 1))) {
@@ -314,10 +297,10 @@ index b3c9305..1e49256 100644
                      (uint32_t)v, ok ? "" : "  (decode failed)");
          }
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
-index f45b42b..87d7f3e 100644
+index f45b42b..6a2b85a 100644
 --- a/src/apu/apu_vp.c
 +++ b/src/apu/apu_vp.c
-@@ -940,38 +940,100 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
+@@ -940,38 +940,91 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  }
  
  /* ============================================================
@@ -326,13 +309,8 @@ index f45b42b..87d7f3e 100644
   *
 - * Since libsamplerate is stubbed, we do a simple nearest-neighbor
 - * resample. This gives us functional audio at the cost of quality.
-+ * rate is output samples per source sample (48 kHz / source rate). This used
-+ * to be ignored and every voice played at 48 kHz: Digimon Rumble Arena 2's
-+ * 44.1 kHz music and dialogue ran 8.8% fast, about 1.5 semitones high.
-+ * Each voice keeps the source samples it has not passed yet; it fetches only
-+ * what the current request needs, so read-ahead stays inside the frame.
-+ * ponytail: linear, not libsamplerate's sinc as in xemu; upgrade if aliasing
-+ * on pitched-up voices is ever audible.
++ * rate is output samples per source sample (48 kHz / source rate). Read-ahead
++ * stays inside the current request.
   * ============================================================ */
  
 +#define RS_LEN 64
@@ -370,7 +348,6 @@ index f45b42b..87d7f3e 100644
 -    (void)rate; /* Ignored until we add proper resampling */
 -    return sample_count;
 +    while (out < requested_num) {
-+        /* Drop the source samples the position has passed. */
 +        while (g_rs[v].pos >= 1.0f && g_rs[v].n > 1) {
 +            g_rs[v].head = (g_rs[v].head + 1) % RS_LEN;
 +            g_rs[v].n--;
@@ -410,11 +387,8 @@ index f45b42b..87d7f3e 100644
   * Voice processing (main per-voice function)
   * ============================================================ */
  
-+/* Per-voice raw sample peak and amplitude envelope, read and cleared by
-+ * RECOMP_APU_LEVELS. */
 +float g_apu_vp_vpeak[MCPX_HW_MAX_VOICES], g_apu_vp_vea[MCPX_HW_MAX_VOICES];
 +
-+/* RECOMP_APU_LEVELS: a voice's data source, for voices that play silence. */
 +void mcpx_apu_vp_describe(MCPXAPUState *d, uint16_t v)
 +{
 +    fprintf(stderr, "[APU-VOICE]   v%d stream=%d persist=%d loop=%d cs=%d ss=%d spb=%d cbo=%u ebo=%u lbo=%u ba=%08X ssl idx=%d seg=%d count=%d,%d base=%d,%d multi=%d\n",
@@ -437,13 +411,11 @@ index f45b42b..87d7f3e 100644
  static void voice_process(MCPXAPUState *d,
                            float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                            float sample_buf[NUM_SAMPLES_PER_FRAME][2],
-@@ -1055,6 +1117,32 @@ static void voice_process(MCPXAPUState *d,
+@@ -1055,6 +1108,30 @@ static void voice_process(MCPXAPUState *d,
          }
      }
  
-+    /* RECOMP_APU_CAPTURE=<voice>: that voice's samples as read from guest
-+     * memory, 16-bit stereo, to apu-voice.raw -- compared against the
-+     * source data, it says whether a defect is in the data or after it. */
++    /* RECOMP_APU_CAPTURE=<voice>: that voice's source samples to apu-voice.raw. */
 +    {
 +        static int cap = -2;
 +        static FILE *capf;
@@ -470,16 +442,16 @@ index f45b42b..87d7f3e 100644
      int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                  NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
      if (!active) return;
-@@ -1175,6 +1263,8 @@ static void voice_process(MCPXAPUState *d,
+@@ -1175,6 +1252,8 @@ static void voice_process(MCPXAPUState *d,
   * Simplified single-threaded version (no worker threads initially)
   * ============================================================ */
  
-+unsigned g_apu_vp_active;   /* voices processed, read by RECOMP_APU_LEVELS */
++unsigned g_apu_vp_active;
 +
  void mcpx_apu_vp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
  {
-@@ -1204,6 +1294,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
+@@ -1204,6 +1283,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
              } else {
                  /* Process voice directly (single-threaded) */
                  voice_process(d, mixbins, d->vp.sample_buf, v, list);
@@ -488,7 +460,7 @@ index f45b42b..87d7f3e 100644
              d->regs[current] = d->regs[next];
          }
 diff --git a/src/apu/apu_xaudio2.c b/src/apu/apu_xaudio2.c
-index cd69e57..5737e16 100644
+index cd69e57..db0c36f 100644
 --- a/src/apu/apu_xaudio2.c
 +++ b/src/apu/apu_xaudio2.c
 @@ -25,7 +25,8 @@
@@ -501,25 +473,22 @@ index cd69e57..5737e16 100644
  
  static IXAudio2               *g_xa2 = NULL;
  static IXAudio2MasteringVoice *g_xa2_master = NULL;
-@@ -34,6 +35,8 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+@@ -34,6 +35,7 @@ static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
  static int                     g_xa2_next_buf = 0;
  static int                     g_xa2_initialized = 0;
  static int                     g_xa2_frames_written = 0;
-+/* Queue full (frame dropped) / queue empty at submit (gap heard): RECOMP_APU_LEVELS. */
 +int                            g_xa2_dropped, g_xa2_starved;
  
  int xa2_init(void)
  {
-@@ -138,7 +141,21 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
+@@ -138,7 +140,19 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
      if (!g_xa2_initialized || !g_xa2_source) return 0;
  
      IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
 -    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
 +    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { g_xa2_dropped++; return 0; }
-+    /* An empty queue (start, or an underrun) gets XA2_PRIME frames of silence
-+     * first. The APU makes one 256-sample frame per 5.33 ms of real time and
-+     * XAudio2 pulls in ~10 ms passes, so with nothing in hand almost every
-+     * pass ran dry: ~32 underruns a second, heard as cuts in dialogue. */
++    /* An empty queue gets XA2_PRIME frames of silence first: the APU makes a
++     * frame per 5.33 ms but XAudio2 pulls in ~10 ms passes. */
 +    if (state.BuffersQueued == 0) {
 +        static const int16_t silence[XA2_BUF_SAMPLES][XA2_CHANNELS];
 +        if (g_xa2_frames_written) g_xa2_starved++;
@@ -534,7 +503,7 @@ index cd69e57..5737e16 100644
      idx = g_xa2_next_buf;
      copy_samples = (num_samples > XA2_BUF_SAMPLES) ? XA2_BUF_SAMPLES : num_samples;
 diff --git a/src/input/CMakeLists.txt b/src/input/CMakeLists.txt
-index caef326..869a0b6 100644
+index caef326..8ab587b 100644
 --- a/src/input/CMakeLists.txt
 +++ b/src/input/CMakeLists.txt
 @@ -1,4 +1,4 @@
@@ -543,7 +512,7 @@ index caef326..869a0b6 100644
  
  add_library(xbox_input STATIC
      xinput_device.c
-@@ -6,12 +6,10 @@ add_library(xbox_input STATIC
+@@ -6,12 +6,9 @@ add_library(xbox_input STATIC
  
  target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
  
@@ -553,8 +522,7 @@ index caef326..869a0b6 100644
 -    find_package(SDL2 REQUIRED)
 -    target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
 -endif()
-+# SDL3 for every modern controller (configure with SDL3_DIR = the package's
-+# cmake folder).
++# Configure with SDL3_DIR set to the SDL3 package's cmake folder.
 +find_package(SDL3 REQUIRED CONFIG)
 +target_link_libraries(xbox_input PUBLIC platform SDL3::SDL3)
  
@@ -562,24 +530,17 @@ index caef326..869a0b6 100644
      target_compile_options(xbox_input PRIVATE /W4 /O2)
 diff --git a/src/input/test_input_slots.c b/src/input/test_input_slots.c
 new file mode 100644
-index 0000000..8aada34
+index 0000000..81d9e4f
 --- /dev/null
 +++ b/src/input/test_input_slots.c
-@@ -0,0 +1,184 @@
-+/*
-+ * Player slots and the join lightbar, with four SDL virtual gamepads.
-+ *
-+ * Builds xinput_device.c as is and drives it the way the USB pad model does
-+ * (xbox_InputGetState per port). Checks: four pads become players 1-4; START
-+ * on a pad lights it in its player's colour and no other; an unplugged pad
-+ * frees only its own slot; a new pad takes that free slot.
-+ *
-+ *   cl /nologo /I.. /I<SDL3>\include test_input_slots.c <SDL3>\lib\x64\SDL3.lib
-+ *   (run with SDL3.dll beside it; exit code 0 = pass)
-+ */
+@@ -0,0 +1,167 @@
++// Player slots, lights, button mapping and rumble, on SDL virtual gamepads.
++//
++//   cl /nologo /I.. /I<SDL3>\include test_input_slots.c <SDL3>\lib\x64\SDL3.lib
++//   (run with SDL3.dll beside it; exit code 0 = pass)
 +#include "xinput_device.c"
 +
-+int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }   /* keyboard off */
++int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }   // keyboard off
 +
 +static int s_led[8][3], s_led_set[8];
 +
@@ -636,8 +597,7 @@ index 0000000..8aada34
 +    int i;
 +
 +    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-+    /* Only the virtual pads: a real controller plugged into the test machine
-+     * would take player 1 (correctly) and shift every expectation. */
++    // Virtual pads only: a real controller would take player 1.
 +    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "0");
 +    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
 +    SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "0");
@@ -648,14 +608,13 @@ index 0000000..8aada34
 +    for (i = 0; i < 4; i++)
 +        id[i] = attach(i);
 +
-+    poll_all();                                   /* first poll scans at once */
++    poll_all();                                   // first poll scans at once
 +    for (i = 0; i < 4; i++)
 +        printf("slot %d: %s\n", i + 1, g_pads[i] ? SDL_GetGamepadName(g_pads[i]) : "(empty)");
 +    for (i = 0; i < 4; i++)
 +        CHECK(xbox_InputIsConnected((DWORD)i) && SDL_GetGamepadID(g_pads[i]) == id[i],
 +              "pad %d is not player %d", i + 1, i + 1);
 +
-+    /* START on pad 3: it joins and turns green; nobody else changes. */
 +    j3 = SDL_GetJoystickFromID(id[2]);
 +    SDL_SetJoystickVirtualButton(j3, SDL_GAMEPAD_BUTTON_START, true);
 +    SDL_UpdateGamepads();
@@ -665,9 +624,8 @@ index 0000000..8aada34
 +          "player 3 LED is %d,%d,%d (want green 24,200,64)", s_led[2][0], s_led[2][1], s_led[2][2]);
 +    CHECK(!s_led_set[0] && !s_led_set[1] && !s_led_set[3], "a pad that did not press START was lit");
 +
-+    /* Unplug pad 2: only slot 2 empties; a new pad takes it. */
 +    SDL_DetachVirtualJoystick(id[1]);
-+    SDL_Delay(600);                               /* the slot scan runs twice a second */
++    SDL_Delay(600);                               // the slot scan runs twice a second
 +    poll_all();
 +    CHECK(!xbox_InputIsConnected(1), "slot 2 still connected after unplug");
 +    CHECK(xbox_InputIsConnected(0) && xbox_InputIsConnected(2) && xbox_InputIsConnected(3),
@@ -678,9 +636,7 @@ index 0000000..8aada34
 +    CHECK(xbox_InputIsConnected(1) && SDL_GetGamepadID(g_pads[1]) == id[4],
 +          "the new pad did not take the free slot 2");
 +
-+    /* Face buttons by printed letter: a Switch Pro (057E:2009) has A on the
-+     * right and B at the bottom, so its bottom button must reach the game as B.
-+     * A generic pad keeps the position: bottom is A. */
++    // A Switch Pro (057E:2009) maps by letter: its bottom button is B.
 +    CHECK(face_button(g_pads[0], 0) == SDL_GAMEPAD_BUTTON_SOUTH, "generic pad: A is not the bottom button");
 +    SDL_DetachVirtualJoystick(id[3]);
 +    SDL_Delay(600);
@@ -712,7 +668,6 @@ index 0000000..8aada34
 +              st.Gamepad.bAnalogButtons[XBOX_BUTTON_A], st.Gamepad.bAnalogButtons[XBOX_BUTTON_B]);
 +    }
 +
-+    /* Rumble: the game's motor speeds reach the right pad, and stop at zero. */
 +    {
 +        XBOX_VIBRATION v = { 0x1234, 0xFEDC };
 +        CHECK(xbox_InputSetState(2, &v) == ERROR_SUCCESS, "rumble on player 3 refused");
@@ -724,14 +679,10 @@ index 0000000..8aada34
 +        CHECK(s_rumble[2][0] == 0 && s_rumble[2][1] == 0, "player 3 rumble did not stop");
 +    }
 +
-+    /* SDL numbers pads itself and moves the pad holding a number aside (an
-+     * XInput pad takes its XInput slot), which relit a DualSense as another
-+     * player. A new pad puts every pad back at its slot, and a pad that
-+     * reconnects into a joined player's slot shows that player at once. */
 +    {
 +        SDL_JoystickID nid;
-+        SDL_SetGamepadPlayerIndex(g_pads[0], 3);            /* as SDL would */
-+        SDL_DetachVirtualJoystick(id[2]);                   /* joined player 3 */
++        SDL_SetGamepadPlayerIndex(g_pads[0], 3);            // as SDL would
++        SDL_DetachVirtualJoystick(id[2]);                   // joined player 3
 +        SDL_Delay(600);
 +        poll_all();
 +        nid = attach(7);
@@ -751,10 +702,10 @@ index 0000000..8aada34
 +    return fails ? 1 : 0;
 +}
 diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
-index a91edbe..e4a3286 100644
+index a91edbe..e2caef1 100644
 --- a/src/input/xinput_device.c
 +++ b/src/input/xinput_device.c
-@@ -1,30 +1,27 @@
+@@ -1,30 +1,18 @@
  /**
   * Xbox Input Compatibility Layer
   *
@@ -762,19 +713,11 @@ index a91edbe..e4a3286 100644
 - * Handles the structural differences between the Xbox gamepad
 - * (analog buttons as bytes, separate trigger channels) and the host
 - * (digital face buttons, trigger axes).
-+ * Translates the Xbox controller API to SDL3's gamepad API, which covers
-+ * every modern controller on every platform: Xbox (through XInput), DualShock
-+ * and DualSense, Switch Pro, over USB or Bluetooth (Switch 2 Pro needs an SDL
-+ * built with libusb). Handles the structural differences between the Xbox
-+ * gamepad (analog buttons as
-+ * bytes, separate trigger channels) and the host (digital face buttons,
-+ * trigger axes). Face buttons are positional: the bottom one is Xbox A on
-+ * every controller.
-  *
+- *
 - *   _WIN32 -> Windows XInput
 - *   POSIX  -> SDL2 GameController
-+ * All calls come from the USB pad model's polling thread (usb_gamepad.c), so
-+ * SDL is started and pumped there.
++ * Xbox controller API on SDL3 gamepads. Called from the USB pad model's
++ * polling thread and the presenter (port menu), under one lock.
   */
  
  #include "xinput_xbox.h"
@@ -798,7 +741,7 @@ index a91edbe..e4a3286 100644
  /* ---- keyboard, when there is no pad --------------------------------------
   *
   * A title that waits on PRESS START is unreachable on a machine with no
-@@ -123,73 +120,181 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
+@@ -123,73 +111,164 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
       * has to move whenever the state does or a press is never noticed. */
      pState->dwPacketNumber = ++packet;
  }
@@ -809,19 +752,14 @@ index a91edbe..e4a3286 100644
 +static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 +static int g_joined[XBOX_MAX_CONTROLLERS];
 +
-+/* The port menu (src/video/port_menu.c) reads the pads from the presenter
-+ * thread while the game reads them from the USB pad thread: one lock around
-+ * SDL. While the menu is open the game sees neutral pads; after it closes,
-+ * each pad stays neutral to the game until all its buttons are released, so
-+ * the closing press never reaches the game. */
++/* While the port menu is open the game sees neutral pads; afterwards each pad
++ * stays neutral until released, so the closing press never reaches the game. */
 +static SRWLOCK g_sdl_lock = SRWLOCK_INIT;
 +static volatile LONG g_menu_open;
 +static int g_hold[XBOX_MAX_CONTROLLERS];
 +
-+/* Players join the game by pressing START. On that first press the pad shows
-+ * its player: the player-number lights, and the lightbar in that player's
-+ * character-select colour (red, blue, green, yellow). Pads without them
-+ * ignore both calls. */
++/* On joining (first START) a pad shows its player: player lights and the
++ * character-select colour. */
 +static void show_player(DWORD port)
 +{
 +    static const Uint8 colour[XBOX_MAX_CONTROLLERS][3] = {
@@ -831,9 +769,6 @@ index a91edbe..e4a3286 100644
 +    SDL_SetGamepadLED(g_pads[port], colour[port][0], colour[port][1], colour[port][2]);
 +}
 +
-+/* Start SDL on first use, then keep the player slots in step with what is
-+ * plugged in: a pad keeps its slot while connected, and a new one takes the
-+ * first free slot, so host pad n is player n. */
 +static void sync_pads(void)
  {
 -    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
@@ -847,8 +782,7 @@ index a91edbe..e4a3286 100644
 +
 +    if (!started) {
 +        started = 1;
-+        /* No SDL window here, and the console never ignored a pad while
-+         * another window had the focus. */
++        /* There is no SDL window, and the console never ignored a pad. */
 +        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 +        if (!SDL_Init(SDL_INIT_GAMEPAD))
 +            fprintf(stderr, "[INPUT] SDL_Init failed: %s\n", SDL_GetError());
@@ -882,11 +816,9 @@ index a91edbe..e4a3286 100644
      }
 +    SDL_free(ids);
 +
-+    /* SDL numbers pads itself (an XInput pad takes its XInput slot) and moves
-+     * the pad holding that number aside, which relights a DualSense as another
-+     * player. Put every pad back at its own slot, lowest first so none is moved
-+     * again, and show a joined player at once on a pad that (re)connects into
-+     * its slot: past the title nobody presses START again. */
++    /* SDL renumbers pads on connect (an XInput pad takes its XInput slot),
++     * which relights a DualSense as another player: restore every slot, lowest
++     * first, and relight joined players, who never press START again. */
 +    if (opened)
 +        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
 +            if (g_pads[i] && g_joined[i])
@@ -905,10 +837,8 @@ index a91edbe..e4a3286 100644
 +    ReleaseSRWLockExclusive(&g_sdl_lock);
 +}
 +
-+/* The button printed with Xbox letter 0 A, 1 B, 2 X, 3 Y. A pad printed with
-+ * letters sends the one pressed -- Nintendo pads have A on the right, where
-+ * Xbox has B, and the game's prompts name letters. Pads printed with shapes
-+ * (PlayStation) keep the position: the bottom one is A. */
++/* Xbox letter 0 A, 1 B, 2 X, 3 Y. Lettered pads map by label (Nintendo's A is
++ * on the right); shaped pads (PlayStation) by position. */
 +static SDL_GamepadButton face_button(SDL_Gamepad *c, int letter)
 +{
 +    static const SDL_GamepadButton pos[4] = {
@@ -978,7 +908,6 @@ index a91edbe..e4a3286 100644
 +    if (SDL_GetGamepadButton(c, SDL_GAMEPAD_BUTTON_RIGHT_STICK)) btn |= XBOX_GAMEPAD_RIGHT_THUMB;
 +    pState->Gamepad.wButtons = btn;
 +
-+    /* Analog on the console, so a press is 255 rather than a flag. */
 +    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = SDL_GetGamepadButton(c, face_button(c, 0)) ? 255 : 0;
 +    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = SDL_GetGamepadButton(c, face_button(c, 1)) ? 255 : 0;
 +    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] = SDL_GetGamepadButton(c, face_button(c, 2)) ? 255 : 0;
@@ -1010,25 +939,22 @@ index a91edbe..e4a3286 100644
 -     * and there is no special case left to get wrong. */
 +        SDL_GetGamepadButton(c, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) ? 255 : 0;
 +
-+    /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
 +    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] =
 +        (BYTE)(SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
 +    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] =
 +        (BYTE)(SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
 +
-+    /* SDL Y axis points down; the Xbox Y axis points up -- invert.
-+     * Use (-1 - v) so v = -32768 does not overflow SHORT. */
++    /* SDL's Y points down. (-1 - v) inverts without overflowing at -32768. */
 +    pState->Gamepad.sThumbLX = SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_LEFTX);
 +    pState->Gamepad.sThumbLY = (SHORT)(-1 - SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_LEFTY));
 +    pState->Gamepad.sThumbRX = SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_RIGHTX);
 +    pState->Gamepad.sThumbRY = (SHORT)(-1 - SDL_GetGamepadAxis(c, SDL_GAMEPAD_AXIS_RIGHTY));
 +
 +#if defined(_WIN32)
-+    /* The keyboard merges on top of a real pad on port 0, so both work. */
      if (dwPort == 0 && keyboard_enabled()) {
          XBOX_INPUT_STATE kb;
          int i;
-@@ -202,176 +307,150 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+@@ -202,176 +281,142 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
          if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
          if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
          if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
@@ -1095,8 +1021,7 @@ index a91edbe..e4a3286 100644
 +        memset(pState, 0, sizeof *pState);
 +        pState->dwPacketNumber = packet;
 +    } else if (pState->Gamepad.wButtons & XBOX_GAMEPAD_BACK) {
-+        /* Back+Start held opens the port menu: Start never reaches the game
-+         * while Back is down, so the combo cannot pause or leave a screen. */
++        /* Start is withheld while Back is down: Back+Start opens the menu. */
 +        pState->Gamepad.wButtons &= (WORD)~XBOX_GAMEPAD_START;
 +    }
 +    return r;
@@ -1115,9 +1040,7 @@ index a91edbe..e4a3286 100644
 -
 -/* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 -static void open_controllers(void)
-+/* Every pad's buttons merged, for the port menu (PM_* in port_menu.h); the
-+ * left stick counts as the D-pad. Reads SDL directly, so the menu works while
-+ * the game, and with it the emulated USB polling, is held at its flip. */
++/* Reads SDL directly: the emulated USB polling stops while the game is held. */
 +void xbox_InputMenuPoll(int *buttons)
  {
 -    int slot = 0;
@@ -1149,10 +1072,8 @@ index a91edbe..e4a3286 100644
 +    }
 +    ReleaseSRWLockExclusive(&g_sdl_lock);
 +
-+    /* RECOMP_MENU_SCRIPT=ms:button,...: scripted menu presses for automated
-+     * runs (the pad script drives the emulated USB pads, which the menu does
-+     * not read). Each press lasts 150 ms. Buttons: guide back start up down
-+     * left right a b. */
++    /* RECOMP_MENU_SCRIPT=ms:button,...: scripted 150 ms presses for automated
++     * runs (guide back start up down left right a b). */
 +    {
 +        static const char *script;
 +        static int parsed;
@@ -1203,8 +1124,7 @@ index a91edbe..e4a3286 100644
 +    DWORD rc = ERROR_DEVICE_NOT_CONNECTED;
 +    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
 +        return rc;
-+    /* A real pad holds its motors until the next report, and titles send one
-+     * only on a change; SDL wants a duration, so ask for its maximum (65 s). */
++    /* A pad holds its motors until the next report; SDL wants a duration. */
 +    AcquireSRWLockExclusive(&g_sdl_lock);
 +    if (g_pads[dwPort]) {
 +        SDL_RumbleGamepad(g_pads[dwPort], pVibration->wLeftMotorSpeed,
@@ -1263,10 +1183,8 @@ index a91edbe..e4a3286 100644
  }
  
 -DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
-+/* On exit, hand each DualSense's lights back to its firmware, which shows the
-+ * battery state with them (solid blue, or breathing yellow when not fully
-+ * charged). SDL never does this, and a packet still queued dies with the
-+ * process, so give SDL's sender thread (10 ms per packet) time to write it. */
++/* Hands DualSense lights back to the firmware (battery display). The wait
++ * lets SDL's sender thread write the packet before the process ends. */
 +void xbox_InputShutdown(void)
  {
 -    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
@@ -1317,7 +1235,7 @@ index a91edbe..e4a3286 100644
 -
 -#endif /* _WIN32 */
 diff --git a/src/input/xinput_xbox.h b/src/input/xinput_xbox.h
-index 4779275..98bc2d9 100644
+index 4779275..0efa7f9 100644
 --- a/src/input/xinput_xbox.h
 +++ b/src/input/xinput_xbox.h
 @@ -109,6 +109,11 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
@@ -1325,7 +1243,7 @@ index 4779275..98bc2d9 100644
  DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
  
 +/**
-+ * Before the process ends: give the pads' lights back to their firmware.
++ * Call before the process ends: gives the pads' lights back to their firmware.
 + */
 +void xbox_InputShutdown(void);
 +
@@ -1357,7 +1275,7 @@ index b9a02bc..08c7089 100644
  NTSTATUS __stdcall xbox_NtSuspendThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
  NTSTATUS __stdcall xbox_NtResumeThread(HANDLE ThreadHandle, PULONG PreviousSuspendCount);
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index c65ba43..9e4c8e0 100644
+index c65ba43..80fd12d 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
 @@ -924,9 +924,20 @@ static void bridge_NtAllocateVirtualMemory(void)
@@ -1384,27 +1302,15 @@ index c65ba43..9e4c8e0 100644
          if (KERNEL_LOG_ON()) {
              fprintf(stderr, "  [KERNEL] → MEM_COMMIT on existing region 0x%08X, no-op\n", base_hint);
              fflush(stderr);
-@@ -3399,6 +3410,83 @@ static int bridge_async_io_enabled(void)
+@@ -3399,6 +3410,71 @@ static int bridge_async_io_enabled(void)
      return on;
  }
  
-+/* Asynchronous reads complete after the issuing code has moved on.
-+ *
-+ * On hardware a pending read finishes milliseconds later, so the first look
-+ * at its status block always says STATUS_PENDING. Code is written against
-+ * that. Digimon Rumble Arena 2's music streamer issues an overlapped
-+ * ReadFile, polls GetOverlappedResult once at once, and only sets its own
-+ * "read in flight" flag after the request call returns. Completing the read
-+ * before that first poll ran the completion callback before the flag was set,
-+ * so the flag stayed set forever and no music was ever streamed.
-+ *
-+ * The host read still happens immediately (the data is in the buffer); only
-+ * the status block and event are held back until the issuing thread blocks
-+ * (a wait, delay or yield: ReadFile without an OVERLAPPED waits on the
-+ * handle), or until any kernel call sees the entry at least 2 ms old. Not at
-+ * the issuing thread's next call of any kind: ReadFile's own error path calls
-+ * RtlNtStatusToDosError between the request and that first poll. Reads with an APC routine keep the
-+ * inline completion: their routine has to run on the issuing thread. */
++/* Asynchronous reads stay pending until the issuing thread blocks, or for at
++ * least 2 ms. On hardware the first status poll always says STATUS_PENDING,
++ * and titles depend on it (DRA2's music streamer sets its in-flight flag only
++ * after that poll). The data is read at once; only completion is held back.
++ * Reads with an APC routine complete inline: it must run on the issuer. */
 +#define BRIDGE_PENDING_IO_MAX 64
 +static struct {
 +    uint32_t  ios, info, event;
@@ -1468,16 +1374,16 @@ index c65ba43..9e4c8e0 100644
  /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
  static void bridge_NtReadFile(void)
  {
-@@ -3427,8 +3515,14 @@ static void bridge_NtReadFile(void)
+@@ -3425,10 +3501,12 @@ static void bridge_NtReadFile(void)
+     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
+                 XBOX_TO_NATIVE(buffer_va), length, poff);
  
-     /* What a read actually delivered. A decoder that rejects its input cannot
-      * say whether the bytes were wrong or the read was, and the two look
+-    /* What a read actually delivered. A decoder that rejects its input cannot
+-     * say whether the bytes were wrong or the read was, and the two look
 -     * identical from inside the title -- the first bytes settle it. */
 -    {
-+     * identical from inside the title -- the first bytes settle it.
-+     * Opt-in (RECOMP_TRACE_READS): Digimon Rumble Arena 2 verifies ~180k
-+     * 512-byte blocks against SHA signatures while its menu loads, and a
-+     * formatted, flushed line per read made that take minutes. */
++    /* RECOMP_TRACE_READS: each read's first bytes. Opt-in: a line per read
++     * slows titles that verify thousands of blocks. */
 +    static int trace_reads = -1;
 +    if (trace_reads < 0)
 +        trace_reads = getenv("RECOMP_TRACE_READS") != NULL;
@@ -1485,7 +1391,7 @@ index c65ba43..9e4c8e0 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
-@@ -3451,6 +3545,12 @@ static void bridge_NtReadFile(void)
+@@ -3451,6 +3529,12 @@ static void bridge_NtReadFile(void)
                      got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
          fflush(stderr);
      }
@@ -1498,7 +1404,7 @@ index c65ba43..9e4c8e0 100644
      bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
      bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                              iostatus);
-@@ -7678,12 +7778,10 @@ static void bridge_NtSetTimerEx(void)
+@@ -7678,12 +7762,10 @@ static void bridge_NtSetTimerEx(void)
  /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */
  static void bridge_NtSignalAndWaitForSingleObjectEx(void)
  {
@@ -1515,14 +1421,12 @@ index c65ba43..9e4c8e0 100644
  }
  
  /* --- NtWriteFileGather (ordinal 237, 8 args = 32 bytes) --- */
-@@ -9413,6 +9511,52 @@ static void kernel_thunk_dispatch(void)
+@@ -9413,6 +9495,48 @@ static void kernel_thunk_dispatch(void)
      (void)held;
  }
  
-+/* Every guest thread's latest kernel call, for the watchdog. The watchdog
-+ * samples only the main thread's registers, so a title whose main loop is
-+ * waiting on a worker shows nothing about the worker; the call a thread last
-+ * made (and where it returns to) names what it is blocked in or polling. */
++/* Every guest thread's latest kernel call, for the watchdog: it samples only
++ * the main thread, and a worker's last call names what it waits on. */
 +#define KTHREAD_SLOTS 32
 +static struct { DWORD tid; ULONG ordinal; uint32_t esp, ret; DWORD tick; long long calls; } g_kthread[KTHREAD_SLOTS];
 +
@@ -1543,8 +1447,6 @@ index c65ba43..9e4c8e0 100644
 +    }
 +}
 +
-+/* Called from the watchdog: one line per thread, then the code-looking words
-+ * on its guest stack (the call chain it is waiting inside). */
 +void xbox_KernelThreadReport(void)
 +{
 +    DWORD now = GetTickCount();
@@ -1568,7 +1470,7 @@ index c65ba43..9e4c8e0 100644
  static void kernel_thunk_dispatch_body(void)
  {
      int slot = g_kernel_dispatch_slot;
-@@ -9430,6 +9574,7 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9430,6 +9554,7 @@ static void kernel_thunk_dispatch_body(void)
      bridge = g_slot_bridges[slot];
  
      g_kernel_call_count++;
@@ -1576,33 +1478,26 @@ index c65ba43..9e4c8e0 100644
      if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
          g_ordinal_calls[ordinal]++;
  
-@@ -9488,6 +9633,7 @@ static void kernel_thunk_dispatch_body(void)
+@@ -9488,6 +9613,7 @@ static void kernel_thunk_dispatch_body(void)
       * lock, which is the one fact a deadlock report otherwise lacks. */
      g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
      g_esp += 4;
-+    bridge_flush_pending_io(ordinal);   /* reads left pending */
++    bridge_flush_pending_io(ordinal);
  
      /* Name the bridge that corrupts a watched dword.
       *
 diff --git a/src/kernel/kernel_hal.c b/src/kernel/kernel_hal.c
-index 1ad4fff..4888bda 100644
+index 1ad4fff..09a99ae 100644
 --- a/src/kernel/kernel_hal.c
 +++ b/src/kernel/kernel_hal.c
-@@ -167,6 +167,46 @@ void xbox_IrqlDumpHolders(void)
+@@ -167,6 +167,39 @@ void xbox_IrqlDumpHolders(void)
      fflush(stderr);
  }
  
-+/* Dispatch exclusion (RECOMP_IRQL_LOCK=1, off by default).
-+ *
-+ * On the console there is one CPU: code at DISPATCH_LEVEL cannot be entered by
-+ * a DPC or an ISR until it lowers again, and XDK libraries rely on exactly that
-+ * -- XAPI edits its device-change bitmaps from the USB DPC and reads them back
-+ * in XGetDeviceChanges with IRQL raised, with no other lock. Here the DPC and
-+ * ISR run on host threads, so the count above only defers *new* deliveries; a
-+ * routine already running still races the guest. With this on, crossing up to
-+ * DISPATCH_LEVEL takes one process-wide lock and crossing back down releases
-+ * it, on guest threads and on the host threads that deliver ISRs and DPCs
-+ * alike (both cross through here), which is the single-CPU guarantee. */
++/* Dispatch exclusion (RECOMP_IRQL_LOCK=1). The console has one CPU, so code at
++ * DISPATCH_LEVEL cannot be interrupted by a DPC or ISR, and XDK libraries rely
++ * on it. Here those run on host threads, so raising to DISPATCH_LEVEL takes
++ * one process-wide lock, on guest and host threads alike. */
 +static CRITICAL_SECTION s_dispatch_lock;
 +static int s_dispatch_lock_on = -1;
 +static XBOX_THREAD_LOCAL int t_dispatch_held;
@@ -1635,7 +1530,7 @@ index 1ad4fff..4888bda 100644
  static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  {
      int was = (old_level >= DISPATCH_LEVEL);
-@@ -175,6 +215,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+@@ -175,6 +208,7 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  
      if (now == was)
          return;
@@ -1644,7 +1539,7 @@ index 1ad4fff..4888bda 100644
      d = now ? InterlockedIncrement(&g_irql_raised_count)
              : InterlockedDecrement(&g_irql_raised_count);
 diff --git a/src/kernel/kernel_memory.c b/src/kernel/kernel_memory.c
-index e49a219..ed0e1cc 100644
+index e49a219..6b4f053 100644
 --- a/src/kernel/kernel_memory.c
 +++ b/src/kernel/kernel_memory.c
 @@ -10,6 +10,7 @@
@@ -1655,7 +1550,7 @@ index e49a219..ed0e1cc 100644
  #if defined(_WIN32)
  /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
  #include <malloc.h>
-@@ -179,9 +180,21 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
+@@ -179,9 +180,15 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
       * nothing naming this function.
       */
      uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
@@ -1665,15 +1560,9 @@ index e49a219..ed0e1cc 100644
 +    if (va >= XBOX_CONTIG_BASE &&
 +        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
 +        return va - XBOX_CONTIG_BASE;
-+    /* Anything else is ordinary memory, whose storage here is not the
-+     * contiguous window's. Handing its VA back as the physical address made
-+     * it collide with a contiguous offset: every bus master (APU, NV2A, OHCI)
-+     * resolves an address below the contiguous high-water mark into the
-+     * window, so a DirectSound buffer the title placed in its own heap was
-+     * read from unrelated window bytes -- Digimon Rumble Arena 2's menu music
-+     * (a 705,600-byte heap buffer at 0x01281000) played as noise. With 64 MB
-+     * of RAM the first mirror at +64 MB is the same bytes and can never be a
-+     * contiguous offset, and all three resolvers already read it as such. */
++    /* Ordinary memory: its VA would collide with a contiguous offset, which
++     * bus masters resolve into the contiguous window. The first RAM mirror
++     * (+64 MB) holds the same bytes and is unambiguous. */
 +    if (g_xbox_total_ram <= XBOX_CONTIG_SIZE && va < XBOX_CONTIG_SIZE)
 +        return va + XBOX_CONTIG_SIZE;
 +    return va;
@@ -1681,23 +1570,21 @@ index e49a219..ed0e1cc 100644
  
  VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
 diff --git a/src/kernel/kernel_path.c b/src/kernel/kernel_path.c
-index caf6390..49b3363 100644
+index caf6390..6e7a2e7 100644
 --- a/src/kernel/kernel_path.c
 +++ b/src/kernel/kernel_path.c
-@@ -47,7 +47,11 @@ typedef struct {
+@@ -47,7 +47,9 @@ typedef struct {
  
  static const path_rule s_rules[] = {
      { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
 -    { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
-+    /* Partition1 is E:, the console's user-data partition (TDATA/UDATA), and
-+     * belongs with the saves. Mapped to the game dir, DRA2 -- which links U:
-+     * straight to partition1\UDATA\<title id> -- wrote its saves into the
-+     * game's own data folder. */
++    /* Partition1 is E:, the user-data partition (TDATA/UDATA): it belongs with
++     * the saves, not the game files. */
 +    { "\\Device\\Harddisk0\\Partition1\\",    1, "\\E",        "/E"          },
      /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
       * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
       * Without these the path layer reported "Unrecognized Xbox path" and
-@@ -329,7 +333,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
+@@ -329,7 +331,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
       * happy if they already exist. */
      {
          static const WCHAR *subs[] = { L"TitleData", L"UserData", L"Cache",
@@ -1707,21 +1594,14 @@ index caf6390..49b3363 100644
          WCHAR dir[MAX_PATH];
          SHCreateDirectoryExW(NULL, s_save_dir, NULL);
 diff --git a/src/kernel/kernel_sync.c b/src/kernel/kernel_sync.c
-index 21f75d1..53b20b3 100644
+index 21f75d1..081a661 100644
 --- a/src/kernel/kernel_sync.c
 +++ b/src/kernel/kernel_sync.c
-@@ -224,6 +224,31 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
+@@ -224,6 +224,24 @@ NTSTATUS __stdcall xbox_NtWaitForSingleObjectEx(
      return xbox_wait_result_to_ntstatus(result, 1);
  }
  
-+/*
-+ * Release one object and wait on another, atomically. XDK SignalObjectAndWait
-+ * lands here; a worker uses it to drop its job mutex and sleep on the job
-+ * event in one step. The stub that stood here returned STATUS_SUCCESS without
-+ * doing either, so DRA2's save worker spun forever holding the mutex its
-+ * producer needed (481 million calls in 150 s, main thread blocked).
-+ * The host call has the same contract for mutex, event and semaphore.
-+ */
++/* The host call has the same contract for mutex, event and semaphore. */
 +NTSTATUS __stdcall xbox_NtSignalAndWaitForSingleObjectEx(
 +    HANDLE SignalHandle,
 +    HANDLE WaitHandle,
@@ -1744,82 +1624,64 @@ index 21f75d1..53b20b3 100644
      HANDLE Handles[],
 diff --git a/src/kernel/nv2a_gpu.h b/src/kernel/nv2a_gpu.h
 new file mode 100644
-index 0000000..94f84cb
+index 0000000..c8af171
 --- /dev/null
 +++ b/src/kernel/nv2a_gpu.h
-@@ -0,0 +1,50 @@
-+/* D3D11 rasteriser behind the NV2A pushbuffer executor (RECOMP_GPU=1).
-+ *
-+ * The executor keeps doing everything up to a screen-space triangle (vertex
-+ * programs, clipping); this draws those triangles on the host GPU at an
-+ * internal scale (RECOMP_GPU_SCALE) instead of shading pixels on the CPU.
-+ * See docs/architecture.md, "Decided route (October 21, 2026)". */
+@@ -0,0 +1,44 @@
++// D3D11 rasteriser (RECOMP_GPU=1): the executor transforms and clips on the
++// CPU; this draws the triangles at RECOMP_GPU_SCALE.
 +#ifndef NV2A_GPU_H
 +#define NV2A_GPU_H
 +
 +#include <stdint.h>
 +#include "nv2a_combiner.h"
 +
-+/* One texture stage as the shader sees it. */
 +typedef struct {
-+    void    *tex;                          /* nv2a_gpu_texture handle, NULL = white */
++    void    *tex;                          // nv2a_gpu_texture handle, NULL = white
 +    int      cube;
-+    float    uscale, vscale;               /* 1 for normalised formats, 1/size for linear */
-+    uint32_t wrap_u, wrap_v, linear;       /* address modes (1 = wrap), bilinear */
++    float    uscale, vscale;               // 1 for normalised formats, 1/size for linear
++    uint32_t wrap_u, wrap_v, linear;       // address modes (1 = wrap), bilinear
 +} Nv2aGpuStage;
 +
-+/* What a draw needs from the executor's state, in NV2A/GL terms. */
 +typedef struct {
-+    float    width, height, zmax;          /* logical surface, depth units  */
++    float    width, height, zmax;          // logical surface, depth units
 +    uint32_t clip_x, clip_y, clip_w, clip_h;
 +    uint32_t depth_test, depth_func, depth_mask;
 +    uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation, blend_color;
 +    uint32_t color_mask, alpha_test, alpha_func, alpha_ref;
-+    uint32_t cull_enable, cull_face, front_face;   /* NV097 values */
-+    int      use_rc;                       /* register combiners, else d0 * stage 0 */
++    uint32_t cull_enable, cull_face, front_face;   // NV097 values
++    int      use_rc;                       // register combiners, else d0 * stage 0
 +    Nv2aCombiner rc;
 +    uint32_t clip_plane_mode, fog_enable, fog_mode;
 +    float    fog_param[2], fog_rgb[3];
 +    Nv2aGpuStage st[4];
 +} Nv2aGpuState;
 +
-+int  nv2a_gpu_on(void);                    /* RECOMP_GPU set and device up  */
-+/* verts: n vertices laid out as Nv2aVshOutput (8 float4 each), a triangle
-+ * list in submission order. */
++int  nv2a_gpu_on(void);                    // RECOMP_GPU set and device up
++// verts: n vertices laid out as Nv2aVshOutput (8 float4 each), a triangle
++// list in submission order.
 +void nv2a_gpu_draw(const float *verts, int n, const Nv2aGpuState *s);
-+/* The same, as a triangle list of indices into verts[0..n). */
++// The same, as a triangle list of indices into verts[0..n).
 +void nv2a_gpu_draw_indexed(const float *verts, int n, const uint32_t *idx, int nidx,
 +                           const Nv2aGpuState *s);
-+/* flags: NV097_CLEAR_SURFACE bits (0x01 Z, 0x02 stencil, 0xF0 colour). */
++// flags: NV097_CLEAR_SURFACE bits (0x01 Z, 0x02 stencil, 0xF0 colour).
 +void nv2a_gpu_clear(uint32_t flags, uint32_t argb, float depth01, const Nv2aGpuState *s);
 +void nv2a_gpu_present(void);
-+/* Create or refill a texture from ARGB words (0xAARRGGBB), w*h per face, six
-+ * faces for a cube. Returns the handle to pass in Nv2aGpuStage.tex. */
++// Create or refill a texture from ARGB words (0xAARRGGBB), w*h per face, six
++// faces for a cube. Returns the handle to pass in Nv2aGpuStage.tex.
 +void *nv2a_gpu_texture(void *handle, uint32_t w, uint32_t h, int cube, const uint32_t *argb);
 +
 +#endif
 diff --git a/src/kernel/nv2a_gpu_d3d11.c b/src/kernel/nv2a_gpu_d3d11.c
 new file mode 100644
-index 0000000..ae78c41
+index 0000000..4d058d3
 --- /dev/null
 +++ b/src/kernel/nv2a_gpu_d3d11.c
-@@ -0,0 +1,865 @@
-+/* D3D11 rasteriser behind the NV2A pushbuffer executor. See nv2a_gpu.h.
-+ *
-+ * Steps 1-3 of the build order in docs/architecture.md: device and swap chain
-+ * on the framebuffer window, one render target (the back buffer) at the
-+ * internal scale with its depth buffer, the fixed-function state the software
-+ * rasteriser models (depth, blend, colour mask, alpha test), the register
-+ * combiners and texture stages as one uber pixel shader ported from
-+ * nv2a_combiner.c / rc_stage_fetch, textures uploaded by the executor, clears
-+ * and presentation. Per-surface render targets come next.
-+ *
-+ * Everything runs on the executor's thread: the immediate context is not
-+ * thread-safe, and that is the only thread that calls in here.
-+ *
-+ * ponytail: state objects are created per draw and released; D3D11 already
-+ * returns the same object for an identical description, so a cache of our own
-+ * would only duplicate that. */
+@@ -0,0 +1,836 @@
++// D3D11 rasteriser behind the NV2A pushbuffer executor (see nv2a_gpu.h). The
++// register combiners run as one pixel shader ported from nv2a_combiner.c.
++// Executor thread only: the immediate context is not thread-safe. State
++// objects are created per draw; D3D11 already dedupes identical ones.
 +#define COBJMACROS
 +#include "nv2a_gpu.h"
 +#include "../video/port_menu.h"
@@ -1833,7 +1695,7 @@ index 0000000..ae78c41
 +
 +extern void *xbox_FramebufferWindowHandle(void);
 +
-+static int s_state = -1;                  /* -1 untried, 0 off, 1 running */
++static int s_state = -1;                  // -1 untried, 0 off, 1 running
 +static ID3D11Device *s_dev;
 +static ID3D11DeviceContext *s_ctx;
 +static IDXGISwapChain *s_swap;
@@ -1845,11 +1707,10 @@ index 0000000..ae78c41
 +static ID3D11Buffer *s_vb, *s_cb, *s_ib;
 +static UINT s_ib_bytes = 4u << 20;
 +static ID3D11ShaderResourceView *s_white2d, *s_whitecube;
-+/* Presentation: the window-sized back buffer and the blit into it. */
 +static ID3D11RenderTargetView *s_bb_rtv;
 +static ID3D11ShaderResourceView *s_rt_srv;
 +static ID3D11VertexShader *s_blit_vs;
-+static ID3D11PixelShader *s_blit_ps, *s_blit_psa;   /* opaque frame; the menu with its alpha */
++static ID3D11PixelShader *s_blit_ps, *s_blit_psa;   // opaque frame; the menu with its alpha
 +static ID3D11SamplerState *s_blit_smp;
 +static UINT s_bb_w, s_bb_h;
 +static const char s_blit_hlsl[] =
@@ -1860,21 +1721,17 @@ index 0000000..ae78c41
 +"float4 ps(VO i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n"
 +"float4 psa(VO i) : SV_Target { return t.Sample(s, i.uv); }\n";
 +static UINT s_w, s_h, s_vb_bytes = 16u << 20;
-+static float s_ws = 1.0f;   /* RECOMP_WIDESCREEN: x squeeze keeping the 4:3 picture its size */
++static float s_ws = 1.0f;   // RECOMP_WIDESCREEN: x squeeze keeping the 4:3 picture its size
 +static float s_scale = 1.0f;
-+static uint32_t s_debug;               /* RECOMP_GPU_DEBUG: geometry only, solid magenta */
-+static uint32_t s_frame_draws, s_frame_verts;  /* since the last present, for the dump line */
++static uint32_t s_debug;               // RECOMP_GPU_DEBUG: geometry only, solid magenta
++static uint32_t s_frame_draws, s_frame_verts;  // since the last present, for the dump line
 +static float s_first_v[4];
 +static D3D11_RECT s_last_sc;
 +
 +typedef struct { ID3D11Texture2D *tex; ID3D11ShaderResourceView *srv; uint32_t w, h; int cube; } GpuTex;
 +
-+/* Vertices arrive as the executor's Nv2aVshOutput: screen x, y in pixels,
-+ * z in depth-buffer units and the clip-space w; then d0, d1, fog and four
-+ * texture-coordinate sets. Rebuilding clip coordinates as (ndc * w, w) gives
-+ * the hardware back the w it needs for perspective-correct interpolation.
-+ * Colours and fog are interpolated in screen space (noperspective), texture
-+ * coordinates with perspective -- exactly what xf_rows does. */
++// Clip coordinates are rebuilt as (ndc * w, w) for perspective-correct
++// interpolation. Colours and fog are noperspective, as in xf_rows.
 +static const char s_hlsl[] =
 +"cbuffer C : register(b0) {\n"
 +"  float4 vp; uint4 at; uint4 rcm; uint4 misc; float4 fogp; float4 fogc;\n"
@@ -1884,7 +1741,6 @@ index 0000000..ae78c41
 +"struct VI { float4 p:POSITION; float4 d0:COLOR0; float4 d1:COLOR1; float4 f:TEXCOORD4; float4 t[4]:TEXCOORD0; };\n"
 +"struct VO { float4 p:SV_Position; noperspective float4 d0:COLOR0; noperspective float4 d1:COLOR1;\n"
 +"           noperspective float4 f:TEXCOORD4; float4 t[4]:TEXCOORD0; };\n"
-+/* fog_factor() from the executor: per vertex, then interpolated. */
 +"float fogf(float d) {\n"
 +"  if (!misc.w) return 1;\n"
 +"  uint m = (uint)fogp.x; float px = fogp.y, py = fogp.z, f;\n"
@@ -1907,7 +1763,7 @@ index 0000000..ae78c41
 +"    case 3: return v <= r; case 4: return v > r; case 5: return v != r; case 6: return v >= r; }\n"
 +"  return true;\n"
 +"}\n"
-+/* nv2a_combiner.c, line for line. */
++// nv2a_combiner.c, line for line.
 +"static float4 R[16];\n"
 +"float map_in(float x, uint b) {\n"
 +"  float p = max(x, 0);\n"
@@ -1964,7 +1820,7 @@ index 0000000..ae78c41
 +"  } else o = R[12];\n"
 +"  return saturate(o);\n"
 +"}\n"
-+/* rc_stage_fetch(); level 0 only, as the CPU samples. */
++// rc_stage_fetch(); level 0 only, as the CPU samples.
 +"float4 stage(uint st, float4 c, inout bool keep) {\n"
 +"  uint mode = (rcm.y >> (st * 5)) & 0x1F; float q = c.w != 0 ? c.w : 1;\n"
 +"  if (mode == 0) return float4(0, 0, 0, 1);\n"
@@ -2045,7 +1901,7 @@ index 0000000..ae78c41
 +            return NULL;
 +        memset(&td, 0, sizeof td);
 +        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = faces;
-+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;   /* ARGB words, little-endian */
++        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;   // ARGB words, little-endian
 +        td.SampleDesc.Count = 1;
 +        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 +        td.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
@@ -2101,12 +1957,12 @@ index 0000000..ae78c41
 +    s_w = (UINT)(640 * s_scale + 0.5f);
 +    s_h = (UINT)(480 * s_scale + 0.5f);
 +    if (getenv("RECOMP_WIDESCREEN") && atoi(getenv("RECOMP_WIDESCREEN"))) {
-+        s_w = (s_h * 16 / 9 + 1) & ~1u;   /* same height, 16:9 */
++        s_w = (s_h * 16 / 9 + 1) & ~1u;
 +        s_ws = (640 * s_scale) / (float)s_w;
 +    }
-+    hwnd = (HWND)xbox_FramebufferWindowHandle();   /* nv2a_gpu_on waits for it */
++    hwnd = (HWND)xbox_FramebufferWindowHandle();   // nv2a_gpu_on waits for it
 +
-+    {   /* The back buffer is the window; the game draws off screen at s_w x s_h. */
++    {   // The back buffer is the window; the game draws off screen at s_w x s_h.
 +        RECT cr;
 +        GetClientRect(hwnd, &cr);
 +        s_bb_w = cr.right > 0 ? (UINT)cr.right : s_w;
@@ -2126,7 +1982,7 @@ index 0000000..ae78c41
 +                                       D3D11_SDK_VERSION, &sd, &s_swap, &s_dev, NULL, &s_ctx);
 +    if (FAILED(hr)) { fail("D3D11CreateDeviceAndSwapChain", hr); return 0; }
 +
-+    {   /* F11/Alt+Enter are the window's borderless toggle, not DXGI's mode switch. */
++    {   // F11/Alt+Enter are the window's borderless toggle, not DXGI's mode switch.
 +        IDXGIFactory *f = NULL;
 +        if (SUCCEEDED(IDXGISwapChain_GetParent(s_swap, &IID_IDXGIFactory, (void **)&f))) {
 +            IDXGIFactory_MakeWindowAssociation(f, hwnd, DXGI_MWA_NO_ALT_ENTER);
@@ -2139,7 +1995,7 @@ index 0000000..ae78c41
 +    ID3D11Texture2D_Release(bb);
 +    if (FAILED(hr)) { fail("CreateRenderTargetView", hr); return 0; }
 +
-+    memset(&td, 0, sizeof td);                     /* the game's own target */
++    memset(&td, 0, sizeof td);                     // the game's own target
 +    td.Width = s_w; td.Height = s_h; td.MipLevels = 1; td.ArraySize = 1;
 +    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 +    td.SampleDesc.Count = 1;
@@ -2187,12 +2043,12 @@ index 0000000..ae78c41
 +    if (FAILED(hr)) { fail("index buffer", hr); return 0; }
 +    bd.ByteWidth = sizeof(Consts);
 +    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-+    bd.Usage = D3D11_USAGE_DEFAULT;        /* filled by UpdateSubresource, which a */
-+    bd.CPUAccessFlags = 0;                 /* DYNAMIC buffer silently refuses       */
++    bd.Usage = D3D11_USAGE_DEFAULT;        // filled by UpdateSubresource, which a
++    bd.CPUAccessFlags = 0;                 // DYNAMIC buffer silently refuses
 +    hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb);
 +    if (FAILED(hr)) { fail("constant buffer", hr); return 0; }
 +    s_debug = getenv("RECOMP_GPU_DEBUG") != NULL;
-+    {   /* the present blit: fullscreen triangle, linear filtering */
++    {
 +        ID3DBlob *bv = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "vs", "vs_5_0");
 +        ID3DBlob *bp = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "ps", "ps_5_0");
 +        ID3DBlob *ba = compile_src(s_blit_hlsl, sizeof s_blit_hlsl - 1, "psa", "ps_5_0");
@@ -2225,13 +2081,13 @@ index 0000000..ae78c41
 +    if (s_state < 0) {
 +        if (!getenv("RECOMP_GPU") || *getenv("RECOMP_GPU") == '0')
 +            s_state = 0;
-+        else if (xbox_FramebufferWindowHandle())   /* the window opens at the */
-+            s_state = init();                       /* title's first mode set; */
-+    }                                               /* until then the CPU draws */
++        else if (xbox_FramebufferWindowHandle())   // the window opens at the
++            s_state = init();                       // title's first mode set;
++    }                                               // until then the CPU draws
 +    return s_state == 1;
 +}
 +
-+/* GL blend factor -> D3D11; alpha slots cannot take colour factors. */
++// GL blend factor -> D3D11; alpha slots cannot take colour factors.
 +static D3D11_BLEND blend_of(uint32_t f, int alpha)
 +{
 +    switch (f) {
@@ -2277,7 +2133,7 @@ index 0000000..ae78c41
 +    sc.top = (LONG)(s->clip_y * s_scale);
 +    sc.right = (LONG)((s->clip_x + s->clip_w) * s_scale);
 +    sc.bottom = (LONG)((s->clip_y + s->clip_h) * s_scale);
-+    if (s_ws < 1.0f) {   /* widescreen: a full-width scissor opens the sides, others shift */
++    if (s_ws < 1.0f) {   // widescreen: a full-width scissor opens the sides, others shift
 +        LONG bar = (LONG)(s_w - 640 * s_scale) / 2;
 +        if (s->clip_x == 0 && s->clip_w >= s->width) { sc.left = 0; sc.right = (LONG)s_w; }
 +        else { sc.left += bar; sc.right += bar; }
@@ -2294,12 +2150,10 @@ index 0000000..ae78c41
 +    o[3] = (float)(c >> 24) / 255.0f;
 +}
 +
-+/* idx/nidx: a triangle list over verts[0..n), or NULL for verts already in
-+ * triangle-list order. */
-+/* Dynamic buffers as rings: each draw appends with NO_OVERWRITE and only a
-+ * wrap discards. Discarding the whole 16 MB vertex and 4 MB index buffer on
-+ * every draw made the driver rename them each time: frame time grew by about
-+ * 0.13 ms per draw (pause menu 193 draws: 44 fps; options 297: 27 fps). */
++// idx/nidx: a triangle list over verts[0..n), or NULL for verts already in
++// triangle-list order.
++// Dynamic buffers as rings, discarded only on wrap: a discard per draw made
++// the driver rename them every time.
 +static UINT s_vb_pos, s_ib_pos;
 +
 +static UINT ring_put(ID3D11Buffer *b, UINT *pos, UINT size, const void *src, UINT bytes)
@@ -2346,14 +2200,13 @@ index 0000000..ae78c41
 +
 +    memset(&rd, 0, sizeof rd);
 +    rd.FillMode = D3D11_FILL_SOLID;
-+    /* The title's culling. NV2A names the front face in GL's y-up sense, while
-+     * D3D11 judges winding on the y-down target, so the sense flips (build 214
-+     * with it unflipped culled every front face). */
++    // NV2A names the front face in GL's y-up sense; D3D11 judges winding on
++    // the y-down target, so the sense flips.
 +    rd.CullMode = !s->cull_enable ? D3D11_CULL_NONE
 +                : s->cull_face == 0x404 ? D3D11_CULL_BACK
 +                : s->cull_face == 0x405 ? D3D11_CULL_FRONT : D3D11_CULL_NONE;
 +    rd.FrontCounterClockwise = s->front_face == 0x900;
-+    rd.DepthClipEnable = FALSE;             /* nor does it clip depth           */
++    rd.DepthClipEnable = FALSE;             // nor does it clip depth
 +    rd.ScissorEnable = TRUE;
 +    ID3D11Device_CreateRasterizerState(s_dev, &rd, &rs);
 +
@@ -2380,9 +2233,8 @@ index 0000000..ae78c41
 +        | ((s->color_mask & 0x00000001u) ? D3D11_COLOR_WRITE_ENABLE_BLUE : 0)
 +        | ((s->color_mask & 0x01000000u) ? D3D11_COLOR_WRITE_ENABLE_ALPHA : 0);
 +    ID3D11Device_CreateBlendState(s_dev, &bd, &bs);
-+    /* Constant colour is ARGB; the *_ALPHA constant factors want alpha in
-+     * every channel. ponytail: a draw mixing CONSTANT_COLOR and
-+     * CONSTANT_ALPHA gets the colour form for both. */
++    // Constant colour is ARGB; *_ALPHA factors want alpha in every channel.
++    // A draw mixing both gets the colour form.
 +    if (s->blend_sfactor == 0x8003 || s->blend_sfactor == 0x8004
 +        || s->blend_dfactor == 0x8003 || s->blend_dfactor == 0x8004)
 +        bf[0] = bf[1] = bf[2] = bf[3] = (float)(s->blend_color >> 24) / 255.0f;
@@ -2478,8 +2330,7 @@ index 0000000..ae78c41
 +{
 +    if (!nv2a_gpu_on())
 +        return;
-+    /* ponytail: whole-target clears; the title clears its full 640x480 clip.
-+     * A partial clip clear would need a quad draw. */
++    // Whole-target clears: the title always clears its full 640x480 clip.
 +    (void)s;
 +    if (flags & 0xF0) {
 +        float c[4];
@@ -2492,9 +2343,8 @@ index 0000000..ae78c41
 +            depth01 < 0 ? 0 : (depth01 > 1 ? 1 : depth01), 0);
 +}
 +
-+/* RECOMP_FB_DUMP=<prefix>: the frame about to be presented, every 10 s, as
-+ * <prefix>gpuNNNNN.bmp. In GPU mode guest memory no longer holds the frame,
-+ * so the window's own dump would show nothing. */
++// RECOMP_FB_DUMP=<prefix>: the presented frame every 10 s as a .bmp (guest
++// memory no longer holds it in GPU mode).
 +static void dump_frame(void)
 +{
 +    static DWORD last;
@@ -2535,7 +2385,7 @@ index 0000000..ae78c41
 +                *(int32_t *)(h + 22) = (int32_t)s_h; *(uint16_t *)(h + 26) = 1;
 +                *(uint16_t *)(h + 28) = 24; *(uint32_t *)(h + 34) = img;
 +                fwrite(h, 1, 54, f);
-+                for (y = s_h; y-- > 0;) {                 /* bottom-up, BGR */
++                for (y = s_h; y-- > 0;) {                 // bottom-up, BGR
 +                    const uint8_t *p = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
 +                    for (x = 0; x < s_w; x++) {
 +                        uint8_t bgr[3] = { p[x * 4 + 2], p[x * 4 + 1], p[x * 4] };
@@ -2552,9 +2402,6 @@ index 0000000..ae78c41
 +    if (bb) ID3D11Resource_Release(bb);
 +}
 +
-+/* The port menu over the presented frame: its image (port_menu_image) as a
-+ * texture, drawn by the blit's full-screen triangle into a centred viewport
-+ * with alpha blending. */
 +static void *s_menu_tex;
 +static ID3D11BlendState *s_menu_blend;
 +static void draw_menu(void)
@@ -2595,7 +2442,7 @@ index 0000000..ae78c41
 +
 +static void present_frame(int vsync, int menu)
 +{
-+    {   /* Follow the window's size, then letterbox the 4:3 image into it. */
++    {   // Follow the window's size, then letterbox the 4:3 image into it.
 +        HWND hwnd = (HWND)xbox_FramebufferWindowHandle();
 +        RECT cr;
 +        D3D11_VIEWPORT vp;
@@ -2618,7 +2465,7 @@ index 0000000..ae78c41
 +            }
 +        }
 +        if (s_bb_rtv) {
-+            float aspect = (float)s_w / (float)s_h;   /* 4:3, or 16:9 with RECOMP_WIDESCREEN */
++            float aspect = (float)s_w / (float)s_h;   // 4:3, or 16:9 with RECOMP_WIDESCREEN
 +            sx = (float)s_bb_w; sy = sx / aspect;
 +            if (sy > (float)s_bb_h) { sy = (float)s_bb_h; sx = sy * aspect; }
 +            vp.TopLeftX = ((float)s_bb_w - sx) * 0.5f; vp.TopLeftY = ((float)s_bb_h - sy) * 0.5f;
@@ -2636,7 +2483,7 @@ index 0000000..ae78c41
 +            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_rt_srv);
 +            ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_smp);
 +            ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-+            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);  /* the RT is drawn to next */
++            ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);  // the RT is drawn to next
 +            if (menu)
 +                draw_menu();
 +        }
@@ -2644,9 +2491,7 @@ index 0000000..ae78c41
 +    IDXGISwapChain_Present(s_swap, (UINT)vsync, 0);
 +}
 +
-+/* The port menu (src/video/port_menu.c): while it is open the game is held
-+ * here, at its frame flip -- a match does not go on behind the menu -- and
-+ * the last frame is shown under the menu at 60 Hz with the audio muted. */
++// While the port menu is open the game is held at its flip, muted.
 +extern volatile int g_audio_muted;
 +
 +void nv2a_gpu_present(void)
@@ -2656,7 +2501,7 @@ index 0000000..ae78c41
 +    if (!nv2a_gpu_on())
 +        return;
 +    dump_frame();
-+    if (vsync < 0)                       /* 60 Hz pacing; RECOMP_GPU_VSYNC=0 to measure */
++    if (vsync < 0)                       // 60 Hz pacing; RECOMP_GPU_VSYNC=0 to measure
 +        vsync = !(getenv("RECOMP_GPU_VSYNC") && *getenv("RECOMP_GPU_VSYNC") == '0');
 +    if (!port_menu_update()) {
 +        present_frame(vsync, 0);
@@ -2670,7 +2515,7 @@ index 0000000..ae78c41
 +    g_audio_muted = was_muted;
 +}
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index c65632c..dec911a 100644
+index c65632c..de594a2 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -37,6 +37,7 @@
@@ -2692,17 +2537,12 @@ index c65632c..dec911a 100644
      if (!surface_hits_image(offset, 1))
          return offset;
      if ((uint64_t)offset < XBOX_CONTIG_SIZE)
-@@ -121,6 +126,81 @@ static uint32_t dma_resolve(uint32_t offset)
+@@ -121,6 +126,76 @@ static uint32_t dma_resolve(uint32_t offset)
      return offset;                         /* nothing better to offer */
  }
  
-+/* Kelvin semaphores. XDK D3D fences poll a word the GPU writes with
-+ * BACK_END_WRITE_SEMAPHORE_RELEASE (Digimon Rumble Arena 2 spins in its
-+ * pushbuffer-space wait until it changes). The context method carries an
-+ * object handle, which PFIFO translates through RAMHT; the release stores the
-+ * parameter at the DMA object's base plus the semaphore offset. The title
-+ * writes RAMHT and its DMA objects into PRAMIN itself, and the register
-+ * aperture is plain memory here, so both can be read back as written. */
++/* Kelvin semaphore release: XDK D3D fences poll this word. The context handle
++ * resolves through RAMHT, which the title writes into PRAMIN itself. */
 +#define NV097_SET_CONTEXT_DMA_SEMAPHORE        0x01A4   /* values as in nv2a_regs.h */
 +#define NV097_SET_SEMAPHORE_OFFSET             0x1D6C
 +#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
@@ -2711,7 +2551,7 @@ index c65632c..dec911a 100644
 +static uint32_t s_sem_instance, s_sem_offset;
 +static void note_unhandled(uint32_t method, uint32_t param);
 +
-+/* getenv scans the whole environment: per draw it showed in profiles. */
++/* Cached: getenv per draw showed in profiles. */
 +static int pb_verbose(void)
 +{
 +    static int v = -1;
@@ -2774,7 +2614,7 @@ index c65632c..dec911a 100644
  static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
  {
      static int said;
-@@ -188,6 +268,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
+@@ -188,6 +263,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
  #define NV097_FLIP_INCREMENT_WRITE        0x012C
  #define NV097_FLIP_STALL                  0x0130
  #define NV097_ARRAY_ELEMENT16             0x1800
@@ -2784,19 +2624,17 @@ index c65632c..dec911a 100644
  /* Draw a run of vertices straight out of the arrays, with no index list:
   * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
   * appear several times inside one BEGIN_END to draw a longer run. */
-@@ -225,7 +308,10 @@ typedef struct {
+@@ -225,7 +303,8 @@ typedef struct {
  } VertexAttr;
  
  #define NV_VERTEX_ATTRS 16
 -#define NV_MAX_INDICES  4096
-+/* Indices one BEGIN/END batch may carry. DRA2's stages draw single meshes of
-+ * up to 12,391 (RubberTree Falls' cliff); at 4096 the rest was dropped.
-+ * ponytail: fixed ceiling, note_idx_overflow() says when a title exceeds it. */
++/* Indices per BEGIN/END batch: DRA2 draws single meshes of up to 12,391. */
 +#define NV_MAX_INDICES  65536
  #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
  
  /* Texture stage 0, decoded from what the title programmed.
-@@ -250,7 +336,7 @@ typedef struct {
+@@ -250,7 +329,7 @@ typedef struct {
  static struct {
      VertexAttr attr[NV_VERTEX_ATTRS];
      uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
@@ -2805,7 +2643,7 @@ index c65632c..dec911a 100644
      uint32_t   idx_count;
      /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
       * instead of into a buffer the title points at. Same vertex format, a
-@@ -321,6 +407,7 @@ static struct {
+@@ -321,6 +400,7 @@ static struct {
      uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
      int xf_nfmt, xf_seeded;
      uint32_t depth_test, depth_func, depth_mask;
@@ -2813,11 +2651,10 @@ index c65632c..dec911a 100644
      uint32_t zeta_offset, zstencil_clear;
  } s_gpu;
  
-@@ -440,6 +527,15 @@ static void note_texture_use(void)
+@@ -440,6 +520,14 @@ static void note_texture_use(void)
      }
  }
  
-+/* A batch longer than s_gpu.idx can hold loses its tail: say so once. */
 +static void note_idx_overflow(void)
 +{
 +    static int told;
@@ -2829,7 +2666,7 @@ index c65632c..dec911a 100644
  static void note_unhandled(uint32_t method, uint32_t param)
  {
      int i;
-@@ -1910,16 +2006,31 @@ static struct {
+@@ -1910,16 +1998,31 @@ static struct {
      HANDLE start[NV_RASTER_MAX_THREADS], done;
      volatile LONG pending;
      const XfTri *tri;
@@ -2863,31 +2700,16 @@ index c65632c..dec911a 100644
          if (InterlockedDecrement(&s_pool.pending) == 0)
              SetEvent(s_pool.done);
      }
-@@ -1985,6 +2096,255 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
+@@ -1985,6 +2088,233 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
  }
  #endif
  
-+/* Draw-call batching (RECOMP_RASTER_BATCH=0 turns it off).
-+ *
-+ * Splitting only triangles over NV_RASTER_MT_MIN_PIXELS left a 3D frame on
-+ * one core: a character or a stage is thousands of small triangles. Within one
-+ * draw every triangle shares the same state, so the draw's triangles are
-+ * queued and the whole queue is rasterised at once, each thread taking the
-+ * rows y % n == k of every triangle in submission order. A pixel still sees
-+ * its triangles in order, and every pixel touches only its own depth and
-+ * colour, so no locking is needed. The queue is flushed before the next
-+ * pushbuffer method is applied (nv2a_pb_exec_method), which is before any
-+ * state change, clear, fence or flip can observe it.
-+ *
-+ * Vertices are copied: some come from near-plane clipping on the stack. */
-+/* Textures for the D3D11 backend, decoded with sample_tex -- every format,
-+ * swizzle and palette the CPU path already reads -- and uploaded once.
-+ *
-+ * Keyed on what identifies the image (address, format, size, pitch, palette),
-+ * and checked against a hash of its bytes at most once per flip, so a texture
-+ * rewritten in place is re-uploaded on the next frame that uses it.
-+ * ponytail: level 0 only, as the CPU samples; 1024 slots probed 8 deep, a
-+ * collision just costs a re-decode. */
++/* Draw-call batching (RECOMP_RASTER_BATCH=0 turns it off): a draw's triangles
++ * are rasterised together, thread k taking rows y % n == k in submission
++ * order, so no locking is needed. The queue is flushed before the next method
++ * applies. Vertices are copied: clipping builds some on the stack. */
++/* D3D11 textures, decoded once by sample_tex. Keyed by address, format, size,
++ * pitch and palette; a content hash once per flip catches in-place rewrites. */
 +typedef struct {
 +    uint32_t offset, color, w, h, pitch, palette, cube, flip, draw;
 +    uint64_t hash;
@@ -2895,8 +2717,6 @@ index c65632c..dec911a 100644
 +} GpuTexEnt;
 +static uint32_t s_gtex_draw;   /* gpu_state() calls: which draw an entry serves */
 +static GpuTexEnt s_gtex[1024];
-+/* Per-frame cost in GPU mode, reported with [GPU] fps: draws issued, textures
-+ * decoded (a changed or new image), and texels decoded through sample_tex. */
 +static uint64_t s_g_draws, s_g_texmiss, s_g_texels;
 +
 +static uint64_t hash_bytes(const uint8_t *p, size_t n)
@@ -2924,12 +2744,8 @@ index c65632c..dec911a 100644
 +
 +    if (!t->valid || !t->width || !t->height || t->width > 4096 || t->height > 4096)
 +        return NULL;
-+    /* Up to 8 slots from the home slot: this texture's entry if it has one,
-+     * else the first entry the current draw is not using. Evicting an entry
-+     * an earlier stage of the same draw holds freed its D3D texture under
-+     * that stage when the sizes differed -- the attract demo's crash in
-+     * d3d11 (runs 115, 117, 118: a 64x64 replaced a bound 128x128). A draw
-+     * binds at most 4 textures, so a free entry always exists. */
++    /* Never evict an entry this draw binds: that frees a texture still in
++     * use. A draw binds at most 4, so 8 probes always find a free slot. */
 +    home = ((t->offset >> 7) ^ t->color ^ (t->width << 3) ^ t->palette) & 1023;
 +    slot = home;
 +    for (i = 0; i < 8; i++) {
@@ -2985,7 +2801,6 @@ index c65632c..dec911a 100644
 +    return e->gpu;
 +}
 +
-+/* The executor state a D3D11 draw needs (nv2a_gpu.h). */
 +static void gpu_state(Nv2aGpuState *g)
 +{
 +    uint32_t bpp = surface_bpp();
@@ -3041,7 +2856,7 @@ index c65632c..dec911a 100644
 +static XfTri s_q_tri[NV_RASTER_QUEUE];
 +static Nv2aVshOutput s_q_v[NV_RASTER_QUEUE][3];
 +static int s_q_n;
-+static uint64_t s_q_flushes, s_q_tris;     /* reported per frame with [GPU] fps */
++static uint64_t s_q_flushes, s_q_tris;
 +
 +static void raster_queue_flush(void)
 +{
@@ -3119,7 +2934,7 @@ index c65632c..dec911a 100644
  static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                 const Nv2aVshOutput *vc)
  {
-@@ -2070,6 +2430,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2070,6 +2400,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      s_gpu.xf_drawn++;
      T.inv_area = 1.0f / area;
  
@@ -3131,20 +2946,13 @@ index c65632c..dec911a 100644
      xf_rows_parallel(&T, &cnt);
      s_gpu.xf_depth_fail += cnt.depth_fail;
      s_gpu.xf_pixels += cnt.pixels;
-@@ -2176,13 +2541,73 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
+@@ -2176,13 +2511,66 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
      return nv2a_vsh_run((const float (*)[4])in, out);
  }
  
-+/* Vertex transform for a batch, once per distinct index and on all threads.
-+ *
-+ * With the D3D11 backend shading pixels, the vertex-program interpreter is
-+ * the executor's whole cost, and an indexed list names most vertices two or
-+ * three times. A vertex program's output depends only on its inputs, so a
-+ * repeated index reuses the first result; the distinct ones are split across
-+ * the raster pool, which sits idle in GPU mode. nv2a_vsh_run and fetch_attr
-+ * only read shared state, and the program and constants cannot change while
-+ * the executor is here.
-+ * ponytail: direct-mapped dedupe, a collision just transforms twice. */
++/* Vertex programs run once per distinct index, split across the raster pool:
++ * the output depends only on the inputs, and shared state is read-only here.
++ * Direct-mapped dedupe: a collision just transforms twice. */
 +static uint32_t s_xf_src[NV_MAX_INDICES], s_xf_uniq[NV_MAX_INDICES], s_xf_nuniq;
 +
 +static void xf_job(int k, int n)
@@ -3208,14 +3016,11 @@ index c65632c..dec911a 100644
      s_gpu.batches_program++;
      s_gpu.verts_program += n;
      if (s_gpu.blend_enable) {
-@@ -2244,6 +2669,50 @@ static void raster_batch_program(void)
+@@ -2244,6 +2632,47 @@ static void raster_batch_program(void)
      if (s_gpu.texs[0].valid)
          note_texture_use();
  
-+    /* D3D11: the transformed vertices once, as an indexed triangle list. The
-+     * hardware clips in clip space and takes either winding, so none of the
-+     * software rasteriser's per-triangle setup is needed -- in GPU mode that
-+     * setup and its vertex copies were the executor's next-largest cost. */
++    /* D3D11 clips and rasterises; the software per-triangle setup is skipped. */
 +    if (nv2a_gpu_on()) {
 +        static uint32_t gi[NV_MAX_INDICES * 3];
 +        uint32_t m = 0;
@@ -3259,7 +3064,7 @@ index c65632c..dec911a 100644
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
-@@ -2489,7 +2958,7 @@ static void draw_primitive(void)
+@@ -2489,7 +2918,7 @@ static void draw_primitive(void)
          }
      }
  
@@ -3268,7 +3073,7 @@ index c65632c..dec911a 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -2617,6 +3086,8 @@ static void draw_inline_array(void)
+@@ -2617,6 +3046,8 @@ static void draw_inline_array(void)
          goto out;
  
      count = (s_gpu.inline_count * 4) / vsize;
@@ -3277,7 +3082,7 @@ index c65632c..dec911a 100644
      if (count < 3 || count > NV_MAX_INDICES)
          goto out;
      for (a = 0; a < NV_VERTEX_ATTRS; a++)
-@@ -2858,6 +3329,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
+@@ -2858,6 +3289,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
  void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
  {
      static int inited;
@@ -3285,7 +3090,7 @@ index c65632c..dec911a 100644
      if (!inited) {
          inited = 1;
          s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
-@@ -2913,6 +3385,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -2913,6 +3345,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          note_unhandled(method, param);
          return;
      }
@@ -3304,7 +3109,7 @@ index c65632c..dec911a 100644
      switch (method) {
      case NV097_SET_SURFACE_CLIP_HORIZONTAL:
          s_gpu.clip_x = param & 0xFFFF;
-@@ -3003,6 +3487,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3003,6 +3447,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
              fprintf(stderr, "[FTRACE] clear %X surf %08X %ux%u colour %08X%c",
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
@@ -3317,7 +3122,7 @@ index c65632c..dec911a 100644
          clear_surface(param);
          if (param & 0x01)                         /* Z */
              zbuf_clear();
-@@ -3053,7 +3543,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3053,7 +3503,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          if (!s_gpu.prim)
              break;
          for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
@@ -3328,7 +3133,7 @@ index c65632c..dec911a 100644
          break;
      }
  
-@@ -3062,7 +3554,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3062,7 +3514,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
              s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
@@ -3345,7 +3150,7 @@ index c65632c..dec911a 100644
          break;
  
      case NV097_SET_FLIP_READ:
-@@ -3099,6 +3599,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3099,6 +3559,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          /* And this is a completed swap, which is what a title's own swap
           * counter counts -- see xbox_Nv2aFrameCounterFlip. */
          xbox_Nv2aFrameCounterFlip();
@@ -3353,7 +3158,7 @@ index c65632c..dec911a 100644
          /* Hand the window a copy of the frame just finished.
           *
           * The buffer the title has finished is the one the last batch drew
-@@ -3147,7 +3648,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3147,7 +3608,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          }
          s_gpu.drawn_stale = 1;
  
@@ -3362,19 +3167,18 @@ index c65632c..dec911a 100644
              static unsigned n;
              if (n++ < 8) {
                  fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
-@@ -3179,6 +3680,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3179,6 +3640,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x030C: s_gpu.depth_test = param; break; /* DEPTH_TEST_ENABLE */
      case 0x0354: s_gpu.depth_func = param; break; /* DEPTH_FUNC */
      case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
 +
-+    /* Culling: the D3D11 path honours it. */
 +    case 0x0308: s_gpu.cull_enable = param; break; /* CULL_FACE_ENABLE */
 +    case 0x039C: s_gpu.cull_face = param; break;   /* CULL_FACE: 0x404 back, 0x405 front, 0x408 both */
 +    case 0x03A0: s_gpu.front_face = param; break;  /* FRONT_FACE: 0x900 CW, 0x901 CCW */
      case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
      case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
  
-@@ -3425,10 +3931,15 @@ void nv2a_pb_exec_report(void)
+@@ -3425,10 +3890,15 @@ void nv2a_pb_exec_report(void)
          static uint32_t last_flips;
          static unsigned long last_ms;
          unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
@@ -3395,7 +3199,7 @@ index c65632c..dec911a 100644
          last_ms = now;
      }
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 65bbedb..f45bb27 100644
+index 65bbedb..56a7479 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -49,6 +49,7 @@ static uint32_t s_tot_calls;
@@ -3406,12 +3210,10 @@ index 65bbedb..f45bb27 100644
  
  static void note(uint32_t subch, uint32_t method)
  {
-@@ -152,6 +153,43 @@ void nv2a_pb_scan_report(void)
+@@ -152,6 +153,32 @@ void nv2a_pb_scan_report(void)
      fflush(stderr);
  }
  
-+/* Deliver up to n parameters of one method packet, from *va, stopping at
-+ * end_va. Returns how many were delivered. */
 +static uint32_t pb_methods(const uint8_t *mem, uint32_t subch, uint32_t method,
 +                           uint32_t n, int noninc, uint32_t *va,
 +                           uint32_t end_va, uint32_t *words)
@@ -3419,13 +3221,10 @@ index 65bbedb..f45bb27 100644
 +    uint32_t i;
 +    for (i = 0; i < n && *va < end_va; i++) {
 +        uint32_t m = noninc ? method : method + i * 4;
-+        /* The survey is a linear search per word; only pay for it
-+         * when the survey was asked for (it was half the executor). */
++        /* The survey searches per word: only when asked for. */
 +        if (s_scan_enabled > 0)
 +            note(subch, m);
-+        /* Same walk, two consumers: the survey counts, the executor
-+         * acts. Keeping them on one decode means they can never
-+         * disagree about what the stream said. */
++        /* One decode for both consumers, so they never disagree. */
 +        if (s_exec_enabled)
 +            nv2a_pb_exec_method(subch, m, *(const uint32_t *)(mem + *va));
 +        *va += 4;
@@ -3434,23 +3233,17 @@ index 65bbedb..f45bb27 100644
 +    return i;
 +}
 +
-+/* A packet the segment end (DMA_PUT) cut short. The title may advance PUT in
-+ * the middle of a packet -- DRA2 does, for program uploads and long inline
-+ * vertex streams -- and the NV2A pusher keeps the method and the remaining
-+ * count until the words arrive. Restarting at a header instead lost the rest
-+ * of the packet and read its data as commands: a 21-instruction vertex
-+ * program got two slots of a fragment and RubberTree Falls' back wall
-+ * collapsed to one point. Held only for the ring, and only resumed by a
-+ * segment that starts exactly where the cut happened. */
++/* A packet cut short by DMA_PUT: the NV2A pusher keeps the method and the
++ * remaining count until the words arrive. Resumed only by a segment starting
++ * exactly where the cut happened. */
 +static struct { uint32_t subch, method, left, at_va; int noninc; } s_held;
 +
-+/* Where the ring's JUMP sent the walk: the start of the next lap. */
 +static uint32_t s_ring_jump;
 +
  /* Walk commands from va to end_va. Returns the words consumed.
   *
   * A CALL runs a subroutine -- a pushbuffer somewhere else in memory -- up to
-@@ -178,8 +216,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -178,8 +205,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
@@ -3463,7 +3256,7 @@ index 65bbedb..f45bb27 100644
              va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
-@@ -202,18 +242,14 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -202,18 +231,14 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
              uint32_t subch  = (w >> 13) & 7u;
              uint32_t method =  w & 0x1FFCu;
              int noninc = (w & 0xE0000000u) == 0x40000000u;
@@ -3490,7 +3283,7 @@ index 65bbedb..f45bb27 100644
              }
              continue;
          }
-@@ -224,22 +260,45 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
+@@ -224,22 +249,42 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
  
  void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
  {
@@ -3530,11 +3323,8 @@ index 65bbedb..f45bb27 100644
      s_tot_segments++;
  }
 +
-+/* PUT came back below where it was: the title wrote on to the end of its
-+ * ring, put a JUMP there and carried on from the start. Walk from the last
-+ * PUT to that JUMP, then from its target to the new PUT. Scanning only to the
-+ * highest PUT seen before dropped everything written after the last PUT of
-+ * each lap -- the tails of program uploads and vertex streams among it. */
++/* PUT wrapped: walk from the last PUT to the ring's JUMP, then from its
++ * target to the new PUT. */
 +void nv2a_pb_scan_wrap(uint32_t last_put_va, uint32_t put_va)
 +{
 +    s_ring_jump = 0;
@@ -3563,7 +3353,7 @@ index 7fae74c..02fb2b8 100644
              memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
              memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 72d5131..1aed424 100644
+index 72d5131..349eb62 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
 @@ -935,6 +935,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -3574,7 +3364,7 @@ index 72d5131..1aed424 100644
                      extern void nv2a_pb_scan_report(void);
                      static DWORD last_report;
  
-@@ -953,31 +954,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -953,31 +954,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                       * OR-ing its base is the documented round trip, not a
                       * guess. */
                      /* The pushbuffer is a ring, so PUT coming back below
@@ -3592,9 +3382,7 @@ index 72d5131..1aed424 100644
 -                    if (!put_lo || put < put_lo) put_lo = put;
 -                    if (put > put_hi) put_hi = put;
 +                     * where it was is a wrap, not a rewind: the title ended
-+                     * the lap with a JUMP, which nv2a_pb_scan_wrap follows.
-+                     * (Scanning to the highest PUT seen before dropped every
-+                     * command written after the last PUT of each lap.) */
++                     * the lap with a JUMP, which nv2a_pb_scan_wrap follows. */
                      if (last_put && put > last_put) {
                          nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                       XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
@@ -3612,7 +3400,7 @@ index 72d5131..1aed424 100644
                          if (getenv("RECOMP_PB_WRAP_TRACE")) {
                              static unsigned wraps;
                              if (wraps++ < 8)
-@@ -1622,6 +1608,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+@@ -1622,6 +1606,10 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
       * CPU loop polling a global is exactly the case neither of those covers.
       */
      xbox_PeekSample("peek");
@@ -3653,17 +3441,15 @@ index 641a94d..4b4661a 100644
          }
      }
 diff --git a/src/usb/usb_gamepad.c b/src/usb/usb_gamepad.c
-index bd00f3f..fda0860 100644
+index bd00f3f..29f60d6 100644
 --- a/src/usb/usb_gamepad.c
 +++ b/src/usb/usb_gamepad.c
-@@ -556,6 +556,20 @@ static void pad_script_apply(int pad, uint8_t *out)
+@@ -556,6 +556,18 @@ static void pad_script_apply(int pad, uint8_t *out)
      }
  }
  
-+/* The output report is 6 bytes: 0, its length (6), then the left (low-
-+ * frequency) and right (high-frequency) motor speeds as 16-bit values. It
-+ * used to be accepted and dropped, so no title's vibration ever reached the
-+ * host pad. */
++/* Output report: 0, length 6, then the left (low-frequency) and right
++ * (high-frequency) motor speeds as 16-bit values. */
 +void usb_gamepad_output(int pad, const uint8_t *rep, int len)
 +{
 +    XBOX_VIBRATION v;
@@ -3678,15 +3464,14 @@ index bd00f3f..fda0860 100644
  {
      XBOX_INPUT_STATE state;
 diff --git a/src/usb/usb_gamepad.h b/src/usb/usb_gamepad.h
-index 18291d7..57677b3 100644
+index 18291d7..f561447 100644
 --- a/src/usb/usb_gamepad.h
 +++ b/src/usb/usb_gamepad.h
-@@ -35,6 +35,9 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
+@@ -35,6 +35,8 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max);
  
  /* Fill in pad `pad`'s 20-byte input report. Returns the byte count written. */
  int usb_gamepad_report(int pad, uint8_t *out, int max);
-+/* The pad's output report (rumble), from the interrupt OUT endpoint or a
-+ * SET_REPORT on the control pipe. */
++/* Rumble report, from the interrupt OUT endpoint or a control SET_REPORT. */
 +void usb_gamepad_output(int pad, const uint8_t *rep, int len);
  
  /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
@@ -3704,30 +3489,27 @@ index 2189a3b..877aae6 100644
  target_include_directories(xbox_video PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}
 diff --git a/src/video/fb_present.c b/src/video/fb_present.c
-index 08bae4b..3ef13e5 100644
+index 08bae4b..e4b23a8 100644
 --- a/src/video/fb_present.c
 +++ b/src/video/fb_present.c
-@@ -23,9 +23,14 @@
+@@ -23,9 +23,12 @@
  #include <string.h>
  
  extern ptrdiff_t xbox_GetMemoryOffset(void);
-+extern void xbox_InputShutdown(void);   /* src/input/xinput_device.c */
++extern void xbox_InputShutdown(void);
  
  static volatile LONG s_fb_running;
  static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
-+/* The window, for the D3D11 backend (RECOMP_GPU): it presents through a swap
-+ * chain on this same window, and GDI then stays out of the way. */
 +static volatile HWND s_hwnd;
 +void *xbox_FramebufferWindowHandle(void) { return (void *)s_hwnd; }
  static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  
  /* A finished frame, taken at the flip and shown until the next one.
-@@ -140,6 +145,25 @@ int xbox_FramebufferKeyDown(int vk)
+@@ -140,6 +143,24 @@ int xbox_FramebufferKeyDown(int vk)
      return s_key_down[vk] != 0;
  }
  
-+/* The monitor Windows calls display n (its device name ends in DISPLAYn, the
-+ * number shown in Settings > Display). */
++/* Display n as numbered in Windows Settings (device name ends in DISPLAYn). */
 +struct pick { int want, found; RECT r; };
 +static BOOL CALLBACK pick_monitor(HMONITOR mon, HDC dc, LPRECT rc, LPARAM p)
 +{
@@ -3748,13 +3530,11 @@ index 08bae4b..3ef13e5 100644
  static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
  {
      switch (m) {
-@@ -148,8 +172,86 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+@@ -148,8 +169,77 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          InterlockedExchange(&s_fb_running, 0);
          return 0;
  
 +    case WM_APP + 1: {
-+        /* The port menu's Monitor row: move to Windows display n. Borderless
-+         * fills it (WM_MOVE below refits); a window keeps its size. */
 +        struct pick q = { (int)w, 0, { 0 } };
 +        RECT wr;
 +        EnumDisplayMonitors(NULL, NULL, pick_monitor, (LPARAM)&q);
@@ -3765,8 +3545,6 @@ index 08bae4b..3ef13e5 100644
 +    }
 +
 +    case WM_MOVE:
-+        /* Borderless fullscreen follows its monitor: moved to another one
-+         * (Win+Shift+Left/Right), it refits to fill that monitor. */
 +        if (GetWindowLongA(h, GWL_STYLE) & WS_POPUP) {
 +            MONITORINFO mi = { sizeof mi };
 +            RECT wr;
@@ -3781,7 +3559,6 @@ index 08bae4b..3ef13e5 100644
 +        break;
 +
 +    case WM_SETCURSOR:
-+        /* No mouse pointer over the game in fullscreen. */
 +        if (LOWORD(l) == HTCLIENT && (GetWindowLongA(h, GWL_STYLE) & WS_POPUP)) {
 +            SetCursor(NULL);
 +            return TRUE;
@@ -3790,12 +3567,8 @@ index 08bae4b..3ef13e5 100644
 +
      case WM_KEYDOWN:
      case WM_SYSKEYDOWN:
-+        /* F11 or Alt+Enter: borderless fullscreen on this monitor and back.
-+         * The D3D11 backend letterboxes into whatever size the window has. */
-+        /* Esc quits gracefully, but only on the title screen: the game
-+         * project names the guest words that say so (RECOMP_TITLE_STATE=
-+         * address=value,...; every pair must match). Elsewhere -- menus, a
-+         * match -- Esc does nothing. */
++        /* Esc quits only on the title screen, identified by the game project's
++         * RECOMP_TITLE_STATE=address=value,... (all pairs must match). */
 +        if (w == VK_ESCAPE) {
 +            const char *t = getenv("RECOMP_TITLE_STATE");
 +            int match = t && *t;
@@ -3835,7 +3608,7 @@ index 08bae4b..3ef13e5 100644
          if ((unsigned)w < 256)
              s_key_down[w] = 1;
          /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
-@@ -262,6 +364,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -262,6 +352,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
      HDC hdc;
      BITMAPINFO bi;
      RECT r;
@@ -3843,11 +3616,10 @@ index 08bae4b..3ef13e5 100644
  
      (void)unused;
  
-@@ -271,14 +374,35 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -271,14 +362,33 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          wc.lpfnWndProc   = fb_wndproc;
          wc.hInstance     = GetModuleHandleA(NULL);
          wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
-+        /* The exe's icon resource 1 when the game project has one. */
 +        wc.hIcon         = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(1));
          wc.lpszClassName = "XboxRecompFramebuffer";
          RegisterClassA(&wc);
@@ -3862,8 +3634,7 @@ index 08bae4b..3ef13e5 100644
 +    }
      AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
 -    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
-+    {   /* RECOMP_MONITOR=n: start on Windows' display n (0: wherever Windows
-+         * puts it, normally the primary). */
++    {   /* RECOMP_MONITOR=n: start on display n (0: Windows' choice). */
 +        struct pick q = { getenv("RECOMP_MONITOR") ? atoi(getenv("RECOMP_MONITOR")) : 0, 0, { 0 } };
 +        if (q.want > 0)
 +            EnumDisplayMonitors(NULL, NULL, pick_monitor, (LPARAM)&q);
@@ -3881,7 +3652,7 @@ index 08bae4b..3ef13e5 100644
                             r.right - r.left, r.bottom - r.top,
                             NULL, NULL, GetModuleHandleA(NULL), NULL);
      if (!hwnd) {
-@@ -286,6 +410,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -286,6 +396,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          return 0;
      }
      hdc = GetDC(hwnd);
@@ -3892,18 +3663,17 @@ index 08bae4b..3ef13e5 100644
  
      memset(&bi, 0, sizeof(bi));
      bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
-@@ -306,7 +434,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -306,7 +420,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              TranslateMessage(&msg);
              DispatchMessageA(&msg);
          }
 -        if (s_present_idx >= 0 && s_rgb) {
 +        if (getenv("RECOMP_GPU")) {
-+            /* The D3D11 backend presents; GDI would paint over it. */
 +        } else if (s_present_idx >= 0 && s_rgb) {
              /* A finished frame, published by the flip. Copied into s_rgb so
               * the dump path and GDI see one consistent image even if the
               * next flip lands mid-blit. */
-@@ -368,10 +498,15 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+@@ -368,10 +483,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
          Sleep(16);
      }
  
@@ -3911,11 +3681,9 @@ index 08bae4b..3ef13e5 100644
 -    DestroyWindow(hwnd);
 -    free(s_rgb);
 -    s_rgb = NULL;
-+    /* The player closed the window (Alt+F4, the close button): the game ends
-+     * here, as switching the console off would end it. Only this loop used to
-+     * stop, and the title's threads ran on with no window until killed in
-+     * Task Manager. Terminate rather than ExitProcess so a renderer or audio
-+     * thread holding a lock cannot stall DLL shutdown. */
++    /* Closing the window ends the game, like switching the console off.
++     * TerminateProcess, not ExitProcess: a thread holding a lock could stall
++     * DLL shutdown. */
 +    fprintf(stderr, "  [FBWIN] window closed: exiting\n");
 +    fflush(stderr);
 +    xbox_InputShutdown();
@@ -3925,30 +3693,13 @@ index 08bae4b..3ef13e5 100644
  
 diff --git a/src/video/port_menu.c b/src/video/port_menu.c
 new file mode 100644
-index 0000000..ef89be3
+index 0000000..4f218a7
 --- /dev/null
 +++ b/src/video/port_menu.c
-@@ -0,0 +1,308 @@
-+/*
-+ * The port menu.
-+ *
-+ * The console game has no quit and no display settings; this is the port's
-+ * own layer, reachable from a controller so nobody needs the keyboard:
-+ *
-+ *   Resume / Resolution / Widescreen / Fullscreen / Monitor / Quit game
-+ *
-+ * Opened by the system button (PS / Xbox / Home) or by Back+Start held for a
-+ * second, because the Windows Game Bar and Steam may take the system button.
-+ * Any pad navigates (D-pad or left stick, A chooses, B backs out). While it is
-+ * open the presenter holds the game at its frame flip (nv2a_gpu_d3d11.c) and
-+ * the game reads neutral pads (xinput_device.c).
-+ *
-+ * Settings go to settings.ini (RECOMP_SETTINGS_INI, set by the game project).
-+ * Fullscreen and Monitor apply at once through the framebuffer window;
-+ * resolution and widescreen need a restart and say so.
-+ *
-+ * Runs on the presenter thread only.
-+ */
+@@ -0,0 +1,288 @@
++// The port menu: Resume, Resolution, Widescreen, Fullscreen, Monitor, Quit.
++// Back+Start also opens it, because the Game Bar and Steam may take the system
++// button. Resolution and widescreen apply on restart. Presenter thread only.
 +#include "port_menu.h"
 +
 +#include <windows.h>
@@ -3960,7 +3711,7 @@ index 0000000..ef89be3
 +extern void xbox_InputMenuSetOpen(int open);
 +extern void *xbox_FramebufferWindowHandle(void);
 +
-+#define PM_MONITOR_MSG (WM_APP + 1)   /* fb_present.c: move to display n */
++#define PM_MONITOR_MSG (WM_APP + 1)   // fb_present.c: move to display n
 +enum { ROW_RESUME, ROW_RES, ROW_WIDE, ROW_FULL, ROW_MON, ROW_QUIT, ROWS };
 +
 +static int s_open, s_sel, s_confirm, s_yes, s_dirty = 1;
@@ -3983,7 +3734,7 @@ index 0000000..ef89be3
 +    WritePrivateProfileStringA("display", key, v, s_ini);
 +}
 +
-+/* Windows display numbers (the n in \\.\DISPLAYn), in order. */
++// Windows display numbers (the n in \\.\DISPLAYn), in order.
 +static int s_disp[16], s_ndisp;
 +static BOOL CALLBACK list_display(HMONITOR m, HDC dc, LPRECT r, LPARAM p)
 +{
@@ -4034,7 +3785,7 @@ index 0000000..ef89be3
 +static void close_menu(void)
 +{
 +    s_open = 0;
-+    xbox_InputMenuSetOpen(0);   /* the game ignores each pad until it is released */
++    xbox_InputMenuSetOpen(0);   // the game ignores each pad until it is released
 +}
 +
 +static void choose(void)
@@ -4057,7 +3808,7 @@ index 0000000..ef89be3
 +        s_full = !s_full;
 +        ini_set("fullscreen", s_full);
 +        if (h)
-+            PostMessageA(h, WM_KEYDOWN, VK_F11, 0);   /* the window's own toggle */
++            PostMessageA(h, WM_KEYDOWN, VK_F11, 0);   // the window's own toggle
 +        break;
 +    case ROW_MON:
 +        for (i = 0; i < s_ndisp && s_disp[i] != s_mon; i++)
@@ -4070,7 +3821,7 @@ index 0000000..ef89be3
 +        break;
 +    case ROW_QUIT:
 +        s_confirm = 1;
-+        s_yes = 0;   /* "No" first: a stray press never quits */
++        s_yes = 0;   // "No" first: a stray press never quits
 +        break;
 +    }
 +    s_dirty = 1;
@@ -4085,7 +3836,6 @@ index 0000000..ef89be3
 +    edge = b & ~s_prev;
 +    s_prev = b;
 +
-+    /* Back+Start held for a second opens or closes, once per hold. */
 +    if ((b & (PM_BACK | PM_START)) == (PM_BACK | PM_START)) {
 +        if (!s_combo_t0)
 +            s_combo_t0 = now;
@@ -4114,7 +3864,7 @@ index 0000000..ef89be3
 +            if (s_yes) {
 +                HWND h = (HWND)xbox_FramebufferWindowHandle();
 +                if (h)
-+                    PostMessageA(h, WM_CLOSE, 0, 0);   /* the same exit as Alt+F4 */
++                    PostMessageA(h, WM_CLOSE, 0, 0);   // the same exit as Alt+F4
 +            }
 +            s_confirm = 0;
 +            s_dirty = 1;
@@ -4130,7 +3880,6 @@ index 0000000..ef89be3
 +    return s_open;
 +}
 +
-+/* ---- drawing: GDI text into a 32-bit DIB, then straight-alpha ARGB ------- */
 +
 +static uint32_t *s_px;
 +static int s_w, s_h;
@@ -4161,7 +3910,7 @@ index 0000000..ef89be3
 +    memset(&bi, 0, sizeof bi);
 +    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
 +    bi.bmiHeader.biWidth = W;
-+    bi.bmiHeader.biHeight = -H;   /* top-down */
++    bi.bmiHeader.biHeight = -H;   // top-down
 +    bi.bmiHeader.biPlanes = 1;
 +    bi.bmiHeader.biBitCount = 32;
 +    dc = CreateCompatibleDC(NULL);
@@ -4217,8 +3966,7 @@ index 0000000..ef89be3
 +        s_w = W; s_h = H;
 +    }
 +    if (s_px) {
-+        /* GDI drew text on black; its brightest channel is the coverage.
-+         * Composite it over a dark translucent panel. */
++        // GDI text on black: the brightest channel is the coverage.
 +        for (i = 0; i < W * H; i++) {
 +            uint32_t p = bits[i], r = (p >> 16) & 255, g = (p >> 8) & 255, bl = p & 255;
 +            uint32_t cov = r > g ? (r > bl ? r : bl) : (g > bl ? g : bl);
@@ -4239,37 +3987,35 @@ index 0000000..ef89be3
 +}
 diff --git a/src/video/port_menu.h b/src/video/port_menu.h
 new file mode 100644
-index 0000000..977784f
+index 0000000..1efe721
 --- /dev/null
 +++ b/src/video/port_menu.h
-@@ -0,0 +1,22 @@
-+/* The port menu: display settings and Quit, driven by any controller.
-+ * Opened with the system button (PS / Xbox / Home) or Back+Start held 1 s.
-+ * Runs on the presenter thread; see port_menu.c. */
+@@ -0,0 +1,20 @@
++// The port menu (port_menu.c). Presenter thread only.
 +#ifndef PORT_MENU_H
 +#define PORT_MENU_H
 +
 +#include <stdint.h>
 +
-+/* Buttons merged across every pad, from xbox_InputMenuPoll (xinput_device.c). */
++// Buttons merged across every pad, from xbox_InputMenuPoll (xinput_device.c).
 +enum {
 +    PM_GUIDE = 1, PM_BACK = 2, PM_START = 4, PM_UP = 8, PM_DOWN = 16,
 +    PM_LEFT = 32, PM_RIGHT = 64, PM_A = 128, PM_B = 256
 +};
 +
-+/* Polls the pads and advances the menu; returns 1 while it is open. */
++// Polls the pads and advances the menu; returns 1 while it is open.
 +int port_menu_update(void);
 +
-+/* The menu as straight-alpha ARGB pixels for a screen `screen_h` pixels high.
-+ * *changed is set when the pixels differ from the previous call. */
++// The menu as straight-alpha ARGB pixels for a screen `screen_h` pixels high.
++// *changed is set when the pixels differ from the previous call.
 +const uint32_t *port_menu_image(int screen_h, int *w, int *h, int *changed);
 +
 +#endif
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 8e9325e..0c0d5af 100644
+index 8e9325e..34009f1 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -269,17 +269,32 @@ extern RECOMP_TLS uint16_t g_fp_cc;
+@@ -269,17 +269,28 @@ extern RECOMP_TLS uint16_t g_fp_cc;
   * PC narrows the significand only; the exponent keeps the register's range.
   * So a plain (float) cast is right only inside float's range -- outside it,
   * it would turn a large intermediate into inf (and inf*0 into NaN) or flush a
@@ -4277,14 +4023,10 @@ index 8e9325e..0c0d5af 100644
 -static inline double recomp_fp_round24(double x) {
 + * tiny one to 0, where the x87 carries on. Those go the long way.
 + *
-+ * The narrowing follows the RC bits (10-11) too. The cast rounds to nearest,
-+ * but a title that sets RC=chop for fast float-to-int casts -- Digimon Rumble
-+ * Arena 2's game thread runs at 0x0C3F, PC=24 and RC=chop -- gets every sum
-+ * and product truncated by the x87; rounding them to nearest instead moves
-+ * the game's arithmetic off the hardware's in the last bit. The nearest float
-+ * is one step from the directed one at most, so a nextafterf finishes it. ponytail: the double result is itself rounded to nearest
-+ * first, so a value within 2^-53 of a float boundary can still land one step
-+ * off; exact directed rounding would need the operands, not the result. */
++ * The narrowing follows the RC bits (10-11) too: titles set RC=chop for fast
++ * float-to-int casts. The nearest float is at most one step from the directed
++ * one. Limit: x is already rounded to double, so a value within 2^-53 of a
++ * float boundary can still land one step off. */
 +static inline float recomp_fp_dir24(double x, float f, unsigned rc) {
 +    if (rc == 3 ? fabs((double)f) > fabs(x) : rc == 1 ? (double)f > x : rc == 2 && (double)f < x)
 +        f = nextafterf(f, rc == 3 ? 0.0f : rc == 1 ? -INFINITY : INFINITY);
@@ -4308,10 +4050,10 @@ index 8e9325e..0c0d5af 100644
  /* Values in the existing double-backed stack are all representable as normal
   * x87 extended values, including binary64 subnormals. Empty stack tags and
 diff --git a/tests/fp_precision/fp_precision_test.c b/tests/fp_precision/fp_precision_test.c
-index c67e955..3f61118 100644
+index c67e955..12afff2 100644
 --- a/tests/fp_precision/fp_precision_test.c
 +++ b/tests/fp_precision/fp_precision_test.c
-@@ -1,20 +1,50 @@
+@@ -1,20 +1,47 @@
 -/* x87 PC=24: results round to a 24-bit significand, exponent range intact. */
 +/* x87 PC=24: results round to a 24-bit significand, exponent range intact,
 + * in the direction the RC bits ask for. */
@@ -4341,10 +4083,8 @@ index c67e955..3f61118 100644
 +    CHECK(isinf(recomp_fp_round24(INFINITY, CW24)));
 +    CHECK(isnan(recomp_fp_round24(NAN, CW24)));
 +#ifdef _MSC_VER
-+    /* Directed rounding (RC bits), against the host's own single-precision
-+     * multiply under the same rounding mode: a float*float product is exact in
-+     * double, so the model must match it bit for bit. Negative operands too,
-+     * where chop and down differ. */
++    /* Directed rounding against the host's float multiply in the same mode:
++     * a float*float product is exact in double, so it must match bit for bit. */
 +    {
 +        static const unsigned rc_host[4] = { _RC_NEAR, _RC_DOWN, _RC_UP, _RC_CHOP };
 +        unsigned rc, i, seed = 12345;
@@ -4360,7 +4100,6 @@ index c67e955..3f61118 100644
 +                CHECK(recomp_fp_round24((double)a * (double)b, (uint16_t)(CW24 | (rc << 10))) == (double)p);
 +            }
 +        }
-+        /* The game's word: chop pulls a positive inexact result down, a negative one up. */
 +        CHECK(recomp_fp_round24(1.0 + 0x1p-30, 0x0C3F) == 1.0);
 +        CHECK(recomp_fp_round24(-1.0 - 0x1p-30, 0x0C3F) == -1.0);
 +        CHECK(recomp_fp_round24(1.0 + 0x1p-23 * 0.75, 0x0C3F) == 1.0);
@@ -4371,17 +4110,15 @@ index c67e955..3f61118 100644
      return 0;
  }
 diff --git a/tests/nv2a_vsh/nv2a_vsh_test.c b/tests/nv2a_vsh/nv2a_vsh_test.c
-index b229880..378adc3 100644
+index b229880..3257530 100644
 --- a/tests/nv2a_vsh/nv2a_vsh_test.c
 +++ b/tests/nv2a_vsh/nv2a_vsh_test.c
-@@ -63,6 +63,24 @@ int main(void)
+@@ -63,6 +63,22 @@ int main(void)
                 o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
          return 1;
      }
 +
-+    /* The vertex unit clamps its colour outputs to [0, 1]: mov oD0, c[60]
-+     * with c[60] out of range. DRA2 lights a selected menu badge to a
-+     * diffuse of 73, which the combiner's x2 then turned white. */
++    /* The vertex unit clamps its colour outputs to [0, 1]. */
 +    {
 +        uint32_t m[4] = {0};
 +        const float c60[4] = {2.0f, -0.5f, 0.5f, 1.5f};
@@ -4412,22 +4149,13 @@ index 0000000..63a7ace
 +add_test(NAME pb-split-packet COMMAND pb-split-test)
 diff --git a/tests/pb_scan/pb_split_test.c b/tests/pb_scan/pb_split_test.c
 new file mode 100644
-index 0000000..3918488
+index 0000000..9d8e6ac
 --- /dev/null
 +++ b/tests/pb_scan/pb_split_test.c
-@@ -0,0 +1,84 @@
-+/* A packet whose data runs past the submitted end (DMA_PUT) continues in the
-+ * next segment, as the NV2A pusher keeps the method and remaining count.
-+ *
-+ * The walker used to stop the packet at the segment end and read the next
-+ * segment's first words as command headers: DRA2's program uploads and
-+ * inline vertex streams were cut that way, so a 21-instruction vertex
-+ * program had its first two slots replaced by a fragment and the RubberTree
-+ * Falls back wall collapsed to one point.
-+ *
-+ * Checks: a split increasing packet delivers every word to the right method;
-+ * a split non-increasing packet keeps its method; a segment that does not
-+ * start where the cut happened drops the pending packet (as before). */
+@@ -0,0 +1,73 @@
++// A packet cut by DMA_PUT continues in the next segment, as on the NV2A
++// pusher; a segment starting elsewhere drops it; a ring wrap resumes at the
++// JUMP's target.
 +#include <stddef.h>
 +#include <stdint.h>
 +#include <stdio.h>
@@ -4457,10 +4185,10 @@ index 0000000..3918488
 +    int i;
 +    _putenv("RECOMP_PB_EXEC=1");
 +
-+    /* Increasing: 0x0B00 x4, cut after two data words. */
++    // Increasing: 0x0B00 x4, cut after two data words.
 +    s_ring[0] = (4u << 18) | 0x0B00u;
 +    for (i = 0; i < 4; i++) s_ring[1 + i] = 0x100u + (uint32_t)i;
-+    s_ring[5] = (1u << 18) | 0x1E9Cu; s_ring[6] = 7;          /* a following packet */
++    s_ring[5] = (1u << 18) | 0x1E9Cu; s_ring[6] = 7;          // a following packet
 +    nv2a_pb_scan(VA(0), VA(3));
 +    nv2a_pb_scan(VA(3), VA(7));
 +    CHECK(s_n == 5, "split increasing packet delivered %d methods (want 5)", s_n);
@@ -4469,7 +4197,7 @@ index 0000000..3918488
 +              "word %d went to 0x%04X = 0x%X", i, s_m[i], s_p[i]);
 +    CHECK(s_n == 5 && s_m[4] == 0x1E9Cu && s_p[4] == 7, "the next header was not read as a header");
 +
-+    /* Non-increasing: 0x1818 x3, cut after one data word. */
++    // Non-increasing: 0x1818 x3, cut after one data word.
 +    s_n = 0;
 +    s_ring[10] = 0x40000000u | (3u << 18) | 0x1818u;
 +    s_ring[11] = 1; s_ring[12] = 2; s_ring[13] = 3;
@@ -4478,7 +4206,7 @@ index 0000000..3918488
 +    CHECK(s_n == 3 && s_m[0] == 0x1818u && s_m[1] == 0x1818u && s_m[2] == 0x1818u && s_p[2] == 3,
 +          "split non-increasing packet: %d methods, last 0x%04X", s_n, s_n ? s_m[s_n - 1] : 0);
 +
-+    /* Cut, then a segment elsewhere: the pending words are not invented. */
++    // Cut, then a segment elsewhere: the pending words are not invented.
 +    s_n = 0;
 +    s_ring[20] = (4u << 18) | 0x0B00u;
 +    s_ring[30] = (1u << 18) | 0x1EA0u; s_ring[31] = 0;
@@ -4486,13 +4214,11 @@ index 0000000..3918488
 +    nv2a_pb_scan(VA(30), VA(32));
 +    CHECK(s_n == 2 && s_m[1] == 0x1EA0u, "a non-contiguous segment continued the old packet (%d methods)", s_n);
 +
-+    /* Wrap: PUT comes back to the ring start. The commands after the last PUT
-+     * up to the title's JUMP are part of the stream, and the walk resumes at
-+     * the JUMP's target -- not at a bound learned from earlier PUTs. */
++    // Wrap: the commands up to the title's JUMP count, then the JUMP's target.
 +    s_n = 0;
-+    s_ring[40] = (1u << 18) | 0x1EA4u; s_ring[41] = 9;        /* ring start */
-+    s_ring[50] = (1u << 18) | 0x1E9Cu; s_ring[51] = 5;        /* after the last PUT */
-+    s_ring[52] = (40u * 4u) | 1u;                             /* JUMP to the ring start */
++    s_ring[40] = (1u << 18) | 0x1EA4u; s_ring[41] = 9;        // ring start
++    s_ring[50] = (1u << 18) | 0x1E9Cu; s_ring[51] = 5;        // after the last PUT
++    s_ring[52] = (40u * 4u) | 1u;                             // JUMP to the ring start
 +    nv2a_pb_scan_wrap(VA(50), VA(42));
 +    CHECK(s_n == 2 && s_m[0] == 0x1E9Cu && s_p[0] == 5 && s_m[1] == 0x1EA4u && s_p[1] == 9,
 +          "wrap delivered %d methods (want 0x1E9C then 0x1EA4)", s_n);
@@ -4561,14 +4287,13 @@ index 7ecb09d..441d67c 100644
          for k, v in saved.items():
              setattr(config, k, v)
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
-index e7ab880..6753ec1 100644
+index e7ab880..2794ce9 100644
 --- a/tools/recomp/lifter.py
 +++ b/tools/recomp/lifter.py
-@@ -335,6 +335,12 @@ COND_MAP = {
+@@ -335,6 +335,11 @@ COND_MAP = {
  }
  
  # Instructions that set arithmetic flags (primary set, fully handled)
-+# x87 conditional moves and the jcc whose condition each one tests.
 +_FCMOV_JCC = {
 +    "fcmovb": "jb", "fcmove": "je", "fcmovbe": "jbe", "fcmovu": "jp",
 +    "fcmovnb": "jae", "fcmovne": "jne", "fcmovnbe": "ja", "fcmovnu": "jnp",
@@ -4577,7 +4302,7 @@ index e7ab880..6753ec1 100644
  FLAG_SETTERS = frozenset({
      "cmp", "test", "sub", "add", "and", "or", "xor",
      "inc", "dec", "neg", "shl", "shr", "sar", "imul", "adc", "sbb",
-@@ -1562,7 +1568,8 @@ class Lifter:
+@@ -1562,7 +1567,8 @@ class Lifter:
          if m == "int3":
              return ["/* int3: debug-trap slide byte, stepped over */"]
          if m in ("leave",):
@@ -4587,7 +4312,7 @@ index e7ab880..6753ec1 100644
          if m in ("cld", "std"):
              return [f"g_df = {0 if m == 'cld' else 1}; /* {m} */"]
          if m == "lahf":
-@@ -1776,24 +1783,9 @@ class Lifter:
+@@ -1776,24 +1782,9 @@ class Lifter:
              return [f"/* mov: bad operands */"]
          src = _fmt_operand_read(ops[1])
          out = [_fmt_operand_write(ops[0], src)]
@@ -4615,7 +4340,7 @@ index e7ab880..6753ec1 100644
          return out
  
      def _lift_movzx(self, insn, ops):
-@@ -1833,7 +1825,10 @@ class Lifter:
+@@ -1833,7 +1824,10 @@ class Lifter:
          if len(ops) < 2 or ops[1].type != "mem":
              return [f"/* lea: unexpected operands */"]
          addr_expr = _fmt_mem(ops[1])
@@ -4627,7 +4352,7 @@ index e7ab880..6753ec1 100644
  
      def _lift_xchg(self, insn, ops):
          if len(ops) < 2:
-@@ -1867,10 +1862,14 @@ class Lifter:
+@@ -1867,10 +1861,14 @@ class Lifter:
              # the function is erased before a return-time trace can see it --
              # yet the pops run *before* that restore, so drift is exactly what
              # breaks them. This is the only point the drift is observable.
@@ -4645,7 +4370,7 @@ index e7ab880..6753ec1 100644
          else:
              return [f"{{ uint32_t _tmp; POP32(esp, _tmp); {_fmt_operand_write(ops[0], '_tmp')} }}"]
  
-@@ -2045,11 +2044,42 @@ class Lifter:
+@@ -2045,11 +2043,42 @@ class Lifter:
      def _lift_shrd(self, insn, ops):
          return self._lift_double_shift(insn, ops, "shrd")
  
@@ -4688,7 +4413,7 @@ index e7ab880..6753ec1 100644
              return [
                  f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
                  f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-@@ -2070,6 +2100,9 @@ class Lifter:
+@@ -2070,6 +2099,9 @@ class Lifter:
          if len(ops) < 1:
              return [f"/* {m}: no operand */"]
          src = _fmt_operand_read(ops[0])
@@ -4698,7 +4423,7 @@ index e7ab880..6753ec1 100644
          if m == "mul":
              return [
                  f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-@@ -3740,8 +3773,11 @@ class Lifter:
+@@ -3740,8 +3772,11 @@ class Lifter:
              pops = m.endswith("pi") or m.endswith("ip")
              pop_code = " fp_pop();" if pops else ""
              rhs = self._fcom_rhs(ops)
@@ -4711,16 +4436,12 @@ index e7ab880..6753ec1 100644
          if m == "fnstsw":
              # `fnstsw ax` after an FPU compare is half of the pre-SSE float
              # branch idiom `fcomp; fnstsw ax; test ah, mask; j(p/np/z/nz)`.
-@@ -3941,6 +3977,24 @@ def lift_basic_block(lifter, bb, flag_state=None):
+@@ -3941,6 +3976,20 @@ def lift_basic_block(lifter, bb, flag_state=None):
                  i += 1
                  continue
  
-+        # FCMOVcc st(0), st(i): the x87 conditional move reads EFLAGS like
-+        # cmovcc, almost always straight after fcomi/fucomi. It fell through to
-+        # the FPU catch-all and became a comment, so every float clamp built as
-+        # fucomi+fcmovb/fcmovnbe kept its unclamped value -- DRA2's stick
-+        # deadzone turned a centred stick into a constant deflection and the
-+        # main menu rotated by itself.
++        # FCMOVcc st(0), st(i): reads EFLAGS like cmovcc, almost always right
++        # after fcomi/fucomi, so it uses the tracked compare.
 +        if (curr.mnemonic in _FCMOV_JCC and last_flag_setter
 +                and len(curr.operands) >= 1):
 +            cond = _make_condition(_FCMOV_JCC[curr.mnemonic],
@@ -4966,7 +4687,7 @@ index 0000000..97d9adb
 +    ran = _build_and_run(_source("imul", 1, _OLD_IMUL8))
 +    assert ran.returncode == 1, ran.stdout + ran.stderr
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 3cd9250..e3fbc83 100644
+index 3cd9250..5a93d60 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
 @@ -1402,13 +1402,20 @@ class FunctionTranslator:
@@ -5003,13 +4724,11 @@ index 3cd9250..e3fbc83 100644
                  "",
              ]
              stub_lines.append(
-@@ -3184,9 +3192,13 @@ class BatchTranslator:
+@@ -3184,9 +3192,11 @@ class BatchTranslator:
              for addr in sorted(unresolved):
                  popped = self.translator._stub_ret_bytes(addr)
                  note = (f"ret {popped}" if popped else "not detected")
-+                # Reported once when first reached: a stub is a silent no-op, and
-+                # DRA2's battle froze in a list walk whose insert one of these
-+                # had skipped. Knowing which ones run is the whole question.
++                # Reported once when first reached: a stub is otherwise a silent no-op.
                  stub_lines.append(
 -                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
 -                    f"/* 0x{addr:08X}: {note} */ }}"

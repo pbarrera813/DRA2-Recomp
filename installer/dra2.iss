@@ -1,13 +1,9 @@
-; Installer for the native DRA2 build: install -> play.
-; Per-user install (no administrator rights), Start menu shortcut, optional
-; desktop icon, launch at the end. The payload includes game data from your own
-; disc, so the setup program is for your own machines only.
-; Built by `reproduce.py --installer`, which passes StageDir (the executable,
-; vcruntime140.dll and README.txt), GameDir (the extracted disc) and Version.
-; /DTest builds an extract-only variant for verification.
+; Per-user installer, built by `reproduce.py --installer`. It contains game data from
+; your own disc, so it is for your own machines only. /DTest builds an extract-only
+; variant for verification.
 
 #ifndef StageDir
-  #error StageDir must be defined (build.py passes it)
+  #error StageDir must be defined (reproduce.py passes it)
 #endif
 #ifndef GameDir
   #error GameDir must be defined (the verified extraction)
@@ -40,11 +36,10 @@ MinVersion=10.0
 UninstallDisplayIcon={app}\DigimonRumbleArena2.exe
 WizardStyle=modern
 #ifdef IconFile
-; The game icon for the setup program (shortcuts use the exe's own icon).
+; Shortcuts take the exe's own icon.
 SetupIconFile={#IconFile}
 #endif
 #ifdef Test
-; Verification build: extracts only -- no uninstaller, registry entry, icons or launch.
 Uninstallable=no
 CreateUninstallRegKey=no
 #endif

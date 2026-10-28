@@ -16,7 +16,7 @@ to other addresses. Everything in this repository that names an address is there
 | `tools/` (seed recovery scripts) | **Yes** | They work on any XBE; their rules are in [`ENGINEERING.md`](ENGINEERING.md). |
 | `data/seeds.json`, `data/coalesce.json` | No | Function addresses in the USA executable. |
 | `data/reference.json` | No | Hashes of the USA files. |
-| `project/src/main.c` | Partly | Most of it is game-neutral. Release-specific: `YOUR_GAME_ENTRY_POINT` (from the XBE header), `RECOMP_TITLE_STATE` (two `.data` addresses that identify the title screen, for Esc to quit) and `RECOMP_APU_DSP_ACK` (a measured DirectSound address). |
+| `project/src/main.c` | Partly | Most of it is game-neutral. Release-specific: `DRA2_ENTRY_POINT` (from the XBE header), `RECOMP_TITLE_STATE` (two `.data` addresses that identify the title screen, for Esc to quit) and `RECOMP_APU_DSP_ACK` (a measured DirectSound address). |
 
 ## The work, in order
 
@@ -24,7 +24,7 @@ to other addresses. Everything in this repository that names an address is there
 2. **Start from this repository's patch.** Clone XboxRecomp at `193e2995` and apply
    `patches/xboxrecomp-193e2995-dra2.patch`, so you begin with every fix found here.
 3. **Run the pipeline without the USA data.** Follow `reproduce.py` step by step, but drop
-   `--seed-functions` and `--coalesce-functions`, and set `YOUR_GAME_ENTRY_POINT` from your XBE
+   `--seed-functions` and `--coalesce-functions`, and set `DRA2_ENTRY_POINT` from your XBE
    header (`python -m tools.xbe_parser default.xbe`).
 4. **Recover the missing functions.** Run the game and collect what stops it:
    - `[ICALL] Failed to resolve VA` lines are indirect-call targets the detector missed;

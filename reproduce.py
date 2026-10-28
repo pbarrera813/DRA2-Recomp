@@ -1,13 +1,10 @@
 """Rebuild the native Windows port of Digimon Rumble Arena 2 from your own disc image.
 
-    python reproduce.py "Digimon Rumble Arena 2 (USA).iso" [--work work] [--xdvdfs path] [--installer]
+    python reproduce.py "Digimon Rumble Arena 2 (USA).iso" [--work work] [--xdvdfs path] [--installer] [--version X]
 
-Your image may be a full .iso or a trimmed .xiso. Nothing from the game is in this repository.
-The script extracts your image and verifies its files, fetches
-XboxRecomp at the commit this work was done against, applies this repository's patch, statically
-recompiles the game's XBE with this repository's function seeds, builds the executable with MSVC and
-puts a playable copy in <work>/dist. Every step is skipped when its output already exists, so an
-interrupted run can simply be started again.
+The image may be a full .iso or a trimmed .xiso. The script verifies its files, applies this
+repository's patch to XboxRecomp, recompiles the XBE, builds with MSVC and puts a playable copy in
+<work>/dist. Finished steps are skipped, so an interrupted run can simply be started again.
 
 Requirements (see README.md): Windows 10/11 x64, Python 3.10+ with `pip install capstone`, Git,
 Visual Studio 2022 or newer with the C++ workload and a Windows SDK, CMake 3.20+, Ninja, and xdvdfs.
@@ -82,8 +79,7 @@ def main():
     else:
         sys.exit('xdvdfs not found: put it on PATH or pass --xdvdfs <path to xdvdfs.exe>.')
 
-    # 1. Extract your image (a full .iso or a trimmed .xiso hold the same files), then check the
-    #    files themselves: the USA release this work was done against, unmodified.
+    # A full .iso and a trimmed .xiso hold the same files, so the files are checked, not the image.
     game = work / 'game'
     if not (game / 'default.xbe').exists():
         run([xdvdfs, 'unpack', a.iso.resolve(), game])
@@ -95,7 +91,6 @@ def main():
     if tree_sha256(game) != REF['game_files_sha256']:
         sys.exit('The extracted files differ from a clean dump (modified, damaged or incomplete).' + redo)
 
-    # 3. XboxRecomp at the commit this work used, plus this repository's patch.
     kit = work / 'xboxrecomp'
     if not (kit / '.dra2-patched').exists():
         if not kit.exists():
@@ -104,8 +99,6 @@ def main():
         run(['git', '-C', kit, 'apply', '--whitespace=nowarn', HERE / 'patches/xboxrecomp-193e2995-dra2.patch'])
         (kit / '.dra2-patched').write_text('ok')
 
-    # 4. Static recompilation: analysis, then C generation, seeded with the function entries this
-    #    work recovered (data/seeds.json).
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                PYTHONPATH=os.pathsep.join(filter(None, [str(kit), os.environ.get('PYTHONPATH')])))
     py = [sys.executable, '-B', '-X', 'utf8', '-m']
@@ -131,7 +124,6 @@ def main():
                   # cold chunks the detector split from their owner (ENGINEERING.md)
                   '--coalesce-functions', HERE / 'data/coalesce.json'], cwd=kit, env=env)
 
-    # 5. SDL3 (controllers): the official release, checked against its published hash.
     sdl_zip = work / 'SDL3-devel-VC.zip'
     if not sdl_zip.exists():
         print('> download', REF['sdl3_url'], flush=True)
@@ -143,9 +135,8 @@ def main():
         zipfile.ZipFile(sdl_zip).extractall(sdl_dir)
     sdl_cmake = next(sdl_dir.glob('SDL3-*/cmake'))
 
-    # 5b. The official SDL3.dll has no Switch 2 controller driver: SDL compiles it only with libusb.
-    #     Rebuild the same SDL3 version from its source release with libusb 1.0.30's official build.
-    #     The .7z is opened with Windows' own tar.exe (bsdtar).
+    # The official SDL3.dll lacks the Switch 2 driver (built only with libusb), so SDL3 is rebuilt
+    # from source. Windows' own tar.exe opens the libusb .7z.
     for key in ('sdl3_src', 'libusb_bin', 'libusb_src'):
         f = work / REF[key + '_url'].rsplit('/', 1)[1]
         if not f.exists():
@@ -161,7 +152,6 @@ def main():
     libusb = work / 'libusb_bin/VS2022/MS64/dll'
     sdl_build = work / 'sdl3_build'
 
-    # 6. Build with MSVC (C11, Release): SDL3 with libusb, then the game.
     build = work / 'build'
     exe = build / 'dra2_recomp.exe'
     if not exe.exists() or not (sdl_build / 'SDL3.dll').exists():
@@ -179,8 +169,6 @@ def main():
             f'cmake --build "{build}" --parallel || exit /b 1']) + '\r\n')
         run(['cmd.exe', '/d', '/c', cmd])
 
-    # 7. A playable copy: the executable, SDL3.dll (with libusb) and libusb-1.0.dll with their licenses,
-    #    and the game data in a "game" folder beside them.
     dist = work / 'dist'
     (dist / 'licenses').mkdir(parents=True, exist_ok=True)
     shutil.copy2(exe, dist / 'DigimonRumbleArena2.exe')
@@ -199,7 +187,7 @@ def main():
         vcrt = next(Path(find_vcvars()).parents[2].glob('Redist/MSVC/*/x64/Microsoft.VC*.CRT/vcruntime140.dll'))
         shutil.copy2(vcrt, dist / 'vcruntime140.dll')
         (dist / 'README.txt').write_text((HERE / 'installer/README.txt').read_text(encoding='utf-8'), encoding='utf-8')
-        icon = HERE / 'project/res/dra2.ico'   # private: the game's own artwork, when you add it
+        icon = HERE / 'project/res/dra2.ico'   # private: the game's own artwork
         run([iscc, f'/DStageDir={dist}', f'/DGameDir={dist / "game"}', f'/DVersion={a.version}',
              *([f'/DIconFile={icon}'] if icon.exists() else []), HERE / 'installer/dra2.iss'])
 

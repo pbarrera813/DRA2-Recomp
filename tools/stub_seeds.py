@@ -1,13 +1,11 @@
-"""Undetected entries that generated code reaches through no-op stubs, filtered to real entries.
+"""Missed function entries that generated code reaches through no-op stubs.
 
-recomp_stubs_unresolved.c lists every direct call/jmp target that is not a detected function; at
-runtime each one silently returns. A target is kept only when (a) a referencing direct branch is a
-clean instruction in the disassembly listing, not an overlapping decode inside a previous
-instruction, (b) the target is itself a clean instruction start or lies in undecoded bytes, so a
-seed can never split an instruction, and (c) some reference is a call, or an unconditional jmp from
-outside every detected function that contains the target. A target reached only by short jumps from just before it is a label inside a function
-whose detected end stopped early (iteration 8: seeding 0x1863C0 split a hash-table resize and its
-epilogue became a stub); those need boundary coalescing, not a seed. Usage: stub_seeds.py <pipeline-N> <gen dir> <out.json>
+recomp_stubs_unresolved.c lists every direct call/jmp target that is not a detected function. A
+target is kept when its referencing branch is a clean instruction, the target cannot split an
+instruction, and some reference is a call or a tail jmp from another function. A target reached
+only by jumps from its own function is a label; seeding it splits that function.
+
+Usage: stub_seeds.py <pipeline dir> <gen dir> <out.json>
 """
 import json
 from pathlib import Path
@@ -36,17 +34,13 @@ for asm in sorted((pipe/'disasm/asm').glob('*.asm')):
         if (mnem == 'call' or mnem.startswith('j')) and t and int(t[1], 16) in stubs:
             refs.setdefault(int(t[1], 16), []).append((addr, mnem))
 junk_cover.sort()
-def inside_instruction(a):  # strictly inside some clean instruction's bytes
+def inside_instruction(a):
     import bisect
     i = bisect.bisect_right(junk_cover, (a, float('inf'))) - 1
     return i >= 0 and junk_cover[i][0] < a < junk_cover[i][1]
-# A branch from inside the function that also contains the target is intra-function, however far:
-# distance rules let through 0xE7200 (a loop back-edge `jne` 0x243 bytes away; its split froze
-# the battle) and 0xEFE0C (a long `jmp` inside a 7.5 KB function; its split broke a switch).
-# Real cross-function branches are calls and tail `jmp`s from another function.
-# A jump-only target must also look like a function start (16-byte aligned, after ret/jmp): a cold
-# chunk detected as its own function jumps back into its owner's labels (0x17DD3A, an epilogue,
-# from sub_0017DD52), and a jump over alignment padding lands on a loop head (0x1863C0).
+# A branch within the target's own function is intra-function however far it reaches. A jump-only
+# target must also look like a function start (16-byte aligned, after ret/jmp): cold chunks jump
+# back into their owner's labels, and jumps over padding land on loop heads.
 spans = [(int(f['start'], 16), int(f['end'], 16)) for f in json.loads((pipe/'disasm/functions.json').read_text())]
 def same_function(a, t):
     return any(s <= a < e and s <= t < e for s, e in spans)
