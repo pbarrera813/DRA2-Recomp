@@ -47,14 +47,16 @@ for k in range(struct.unpack_from('<I', d, 0x11C)[0]):
         words = [struct.unpack_from('<I', d, raw + o)[0] for o in range(0, size - 3, 4)]
         values |= set(words)
         # A vtable slot beside a known entry, pointing into bytes decoded as one instruction: the
-        # decode is wrong there, since real code has no entry inside an instruction.
+        # decode is wrong there, since real code has no entry inside an instruction. Or pointing
+        # right after a ret/jmp with no padding between (0xB8550 follows its neighbour's `ret 4`).
         for i, v in enumerate(words):
-            if 0x11000 <= v < text_end and v % 16 == 0 and v not in prev_end and v not in starts and (
+            if 0x11000 <= v < text_end and v % 16 == 0 and v not in starts and (
+                    v not in prev_end or prev_end[v][0] in ('ret', 'retn', 'jmp')) and (
                     (i and words[i - 1] in starts) or (i + 1 < len(words) and words[i + 1] in starts)):
                 vtable_slots.add(v)
 seeds = sorted({a for a in values if a in prev_end and a not in starts and a % 16 == 0
                 and prev_end[a][1] and prev_end[a][0] in ('ret', 'retn', 'jmp')} | vtable_slots)
 json.dump([{'start': f'0x{s:08x}'} for s in seeds], out.open('x'), indent=1)
-print(len(seeds), 'pointer-referenced entries:', len(vtable_slots), 'vtable slots into undecoded/junk bytes,',
+print(len(seeds), 'pointer-referenced entries:', len(vtable_slots), 'vtable slots,',
       len(seeds) - len(vtable_slots), 'after ret/jmp padding')
 assert not any(0x1DD600 <= s < 0x1DD93D for s in seeds), 'memcpy case labels must not qualify'

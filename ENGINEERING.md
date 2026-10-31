@@ -137,6 +137,10 @@ The rules these scripts apply were learned from failures:
 - Real function pointers are words in `.rdata`/`.data` and `push`/`mov` immediates. A vtable slot
   that points into bytes the decoder ran through means the decode was wrong there, not that the
   code is data.
+- An entry can also start right after its neighbour's `ret`, with no padding. The Multiplayer
+  results screen's "continue" handler (`0xB8550`, a vtable slot) was missed that way: the call
+  failed on every A press and the screen never closed. A vtable slot beside known entries that
+  points right after a `ret`/`jmp` now qualifies.
 - Run logs from a build with a bad split report that split's own labels as missing entries. They
   must not be used as seed sources.
 - The opposite error also occurs: the detector split a function from its own cold chunk (code the
